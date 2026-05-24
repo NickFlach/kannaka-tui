@@ -20,11 +20,32 @@ responsive while the holographic medium does its slow work.
 
 Requires the `kannaka` binary on PATH — see [kannaka-memory](https://github.com/NickFlach/kannaka-memory).
 
+### Pre-built binary (fastest)
+
+Grab the right asset for your platform from the
+[v0.1.0 release page](https://github.com/NickFlach/kannaka-tui/releases/tag/v0.1.0)
+and drop it on your `$PATH`:
+
 ```bash
-cargo install kannaka-tui
+# Linux x86_64
+curl -L -o kannaka-tui https://github.com/NickFlach/kannaka-tui/releases/latest/download/kannaka-tui-linux-x86_64
+chmod +x kannaka-tui
+mv kannaka-tui ~/.local/bin/
 ```
 
-Or grab a release binary from the [releases page](https://github.com/NickFlach/kannaka-tui/releases).
+```powershell
+# Windows
+curl -L -o kannaka-tui.exe https://github.com/NickFlach/kannaka-tui/releases/latest/download/kannaka-tui-windows-x86_64.exe
+```
+
+### Build from git
+
+```bash
+cargo install --git https://github.com/NickFlach/kannaka-tui
+```
+
+(Once the crate is published to crates.io, `cargo install kannaka-tui` will
+also work — pending.)
 
 ## Hotkeys
 
