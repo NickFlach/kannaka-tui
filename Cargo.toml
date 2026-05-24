@@ -1,0 +1,29 @@
+[package]
+name = "kannaka-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal dashboard for the Kannaka constellation — Memory, Status, Bus, Constellation, Dreams, Chat. Pure frontend over the `kannaka` CLI."
+license = "MIT"
+repository = "https://github.com/NickFlach/kannaka-tui"
+readme = "README.md"
+keywords = ["tui", "kannaka", "ratatui", "terminal", "dashboard"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "kannaka-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Terminal UI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Bus / chat-child NDJSON parsing
+serde_json = "1"
+
+# Timestamp formatting in the Bus + Constellation tabs
+chrono = "0.4"
+
+# ~/.kannaka/config.toml resolution + display-name parse
+dirs = "5"
+toml = "0.8"
