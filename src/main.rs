@@ -1476,42 +1476,35 @@ impl App {
                 self.input.insert(self.cursor_pos, c);
                 self.cursor_pos += 1;
             }
-            (_, KeyCode::Backspace) => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                    self.input.remove(self.cursor_pos);
-                }
+            // Cursor edit keys — guards keep behavior identical to the
+            // pre-collapse `if cond { ... }` body (no-op at boundaries).
+            // Falls through to the `_ => {}` catch-all if guard is false.
+            (_, KeyCode::Backspace) if self.cursor_pos > 0 => {
+                self.cursor_pos -= 1;
+                self.input.remove(self.cursor_pos);
             }
-            (_, KeyCode::Delete) => {
-                if self.cursor_pos < self.input.len() {
-                    self.input.remove(self.cursor_pos);
-                }
+            (_, KeyCode::Delete) if self.cursor_pos < self.input.len() => {
+                self.input.remove(self.cursor_pos);
             }
-            (_, KeyCode::Left) => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                }
+            (_, KeyCode::Left) if self.cursor_pos > 0 => {
+                self.cursor_pos -= 1;
             }
-            (_, KeyCode::Right) => {
-                if self.cursor_pos < self.input.len() {
-                    self.cursor_pos += 1;
-                }
+            (_, KeyCode::Right) if self.cursor_pos < self.input.len() => {
+                self.cursor_pos += 1;
             }
             (_, KeyCode::Home) => self.cursor_pos = 0,
             (_, KeyCode::End) => self.cursor_pos = self.input.len(),
 
-            // Scroll history
-            (_, KeyCode::Up) => {
-                if !self.history.is_empty() {
-                    let idx = match self.history_idx {
-                        Some(i) if i > 0 => i - 1,
-                        Some(i) => i,
-                        None => self.history.len() - 1,
-                    };
-                    self.history_idx = Some(idx);
-                    self.input = self.history[idx].clone();
-                    self.cursor_pos = self.input.len();
-                }
+            // Scroll history — no-op when history is empty
+            (_, KeyCode::Up) if !self.history.is_empty() => {
+                let idx = match self.history_idx {
+                    Some(i) if i > 0 => i - 1,
+                    Some(i) => i,
+                    None => self.history.len() - 1,
+                };
+                self.history_idx = Some(idx);
+                self.input = self.history[idx].clone();
+                self.cursor_pos = self.input.len();
             }
             (_, KeyCode::Down) => {
                 if let Some(idx) = self.history_idx {
