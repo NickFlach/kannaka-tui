@@ -596,26 +596,43 @@ impl App {
         self.status_pending = Some(rx);
         self.last_status_poll = Instant::now();
         std::thread::spawn(move || {
+            // ADR-0029 Phase 4b — opt into the envelope shape so we
+            // get an unambiguous success/error signal in stdout. We
+            // read fields under .data.X; tolerate the legacy flat
+            // shape too in case the kannaka binary is older than
+            // v0.6.3 (envelope-aware status landed there).
             let output = Command::new(&bin)
-                .args(["status"])
+                .args(["status", "--envelope"])
                 .env("KANNAKA_QUIET", "1")
                 .output();
             let result = match output {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     serde_json::from_str::<serde_json::Value>(&stdout)
-                        .map(|val| Status {
-                            phi: val["phi"].as_f64().unwrap_or(0.0) as f32,
-                            xi: val["xi"].as_f64().unwrap_or(0.0) as f32,
-                            order: val["mean_order"].as_f64().unwrap_or(0.0) as f32,
-                            memories: val["total_memories"].as_u64().unwrap_or(0),
-                            clusters: val["num_clusters"].as_u64().unwrap_or(0),
-                            links: 0,
-                            level: val["consciousness_level"]
-                                .as_str()
-                                .unwrap_or("Unknown")
-                                .to_string(),
-                            active: val["active_memories"].as_u64().unwrap_or(0),
+                        .map(|val| {
+                            // Envelope detection: schema_version + data present.
+                            // Fall back to flat shape so older kannaka binaries
+                            // still work (they emit the legacy object directly).
+                            let body = if val.get("schema_version").is_some()
+                                && val.get("data").is_some()
+                            {
+                                val["data"].clone()
+                            } else {
+                                val
+                            };
+                            Status {
+                                phi: body["phi"].as_f64().unwrap_or(0.0) as f32,
+                                xi: body["xi"].as_f64().unwrap_or(0.0) as f32,
+                                order: body["mean_order"].as_f64().unwrap_or(0.0) as f32,
+                                memories: body["total_memories"].as_u64().unwrap_or(0),
+                                clusters: body["num_clusters"].as_u64().unwrap_or(0),
+                                links: 0,
+                                level: body["consciousness_level"]
+                                    .as_str()
+                                    .unwrap_or("Unknown")
+                                    .to_string(),
+                                active: body["active_memories"].as_u64().unwrap_or(0),
+                            }
                         })
                         .map_err(|e| format!("status parse: {e}"))
                 }
