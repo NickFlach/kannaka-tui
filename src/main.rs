@@ -140,6 +140,10 @@ struct App {
     dream_rx: Option<mpsc::Receiver<DreamEvent>>,
     dream_run: DreamRunState,
     dream_trigger_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Streaming stdout of a one-shot plugin invocation (`/code`,
+    /// `/topus`). poll_plugin drains lines into chat_messages each
+    /// tick; channel close → clear chat_pending so the spinner stops.
+    plugin_output_rx: Option<mpsc::Receiver<String>>,
 }
 
 const BUS_BACKLOG_CAP: usize = 500;
@@ -305,6 +309,7 @@ impl App {
             dream_rx: None,
             dream_run: DreamRunState::Idle,
             dream_trigger_rx: None,
+            plugin_output_rx: None,
         }
     }
 
@@ -1003,6 +1008,28 @@ impl App {
                 self.cursor_pos = 0;
                 return;
             }
+
+            // Plugin slash commands. `/code <prompt>` execs kannaka-code,
+            // `/topus <prompt>` execs kannaktopus. Both stream stdout
+            // into ChatLines so the operator sees the plugin's output
+            // inline in the conversation. Plugin invocation is async on
+            // its own thread so the TUI stays responsive while the
+            // plugin works.
+            if let Some(prompt) = input.strip_prefix("/code ") {
+                self.spawn_plugin_turn("kannaka-code", "/code", prompt.trim());
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.scroll_offset = 0;
+                return;
+            }
+            if let Some(prompt) = input.strip_prefix("/topus ") {
+                self.spawn_plugin_turn("kannaktopus", "/topus", prompt.trim());
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.scroll_offset = 0;
+                return;
+            }
+
             self.chat_messages.push(ChatLine {
                 who: ChatWho::User,
                 text: input.clone(),
@@ -1214,6 +1241,109 @@ impl App {
             stdin: None,
             ready: false,
         });
+    }
+
+    /// Plugin slash commands — exec `binary` with the prompt as a
+    /// single positional arg. Stdout streams into chat_messages as
+    /// it arrives (line-by-line) so the operator sees the plugin's
+    /// progress live instead of one big blob at the end. Inspired
+    /// by the chat-child pattern but simpler: plugins are one-shot
+    /// (run-to-completion), not interactive REPLs.
+    ///
+    /// `verb` is the slash command echoed back ("/code" or "/topus")
+    /// so the conversation log keeps which path the prompt took.
+    fn spawn_plugin_turn(&mut self, binary: &str, verb: &str, prompt: &str) {
+        // Echo the invocation into the chat tab so the operator sees
+        // what they typed routed to which plugin.
+        self.chat_messages.push(ChatLine {
+            who: ChatWho::User,
+            text: format!("{verb} {prompt}"),
+        });
+
+        // Pre-flight: if the binary isn't on PATH, fail fast with a
+        // discoverable install hint instead of letting Command::spawn
+        // emit a cryptic OS error.
+        if std::process::Command::new(binary).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+            self.chat_messages.push(ChatLine {
+                who: ChatWho::System,
+                text: format!(
+                    "[plugin '{binary}' not found on PATH — install it and try again. \
+                     For kannaka-code: cargo install --git https://github.com/NickFlach/kannaka-code]"
+                ),
+            });
+            return;
+        }
+
+        let bin = binary.to_string();
+        let prompt = prompt.to_string();
+        let (tx, rx) = mpsc::channel::<String>();
+        // The plugin invocation reuses the chat_pending sentinel so
+        // the spinner animation kicks on. Replace with a real per-
+        // plugin tracking field if you need to distinguish later.
+        self.chat_pending = Some(std::sync::mpsc::channel().1);
+
+        std::thread::spawn(move || {
+            let mut child = match std::process::Command::new(&bin)
+                .arg(&prompt)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(format!("[plugin spawn failed: {e}]"));
+                    return;
+                }
+            };
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = child.wait();
+        });
+
+        // Stash the receiver on a per-plugin field so poll() can drain
+        // it into chat_messages. Reuse the bus rx slot conceptually —
+        // actually we need a new field. For minimal-diff this round,
+        // store it inline as a small queue + thread → see poll_plugin
+        // for drain logic.
+        self.plugin_output_rx = Some(rx);
+    }
+
+    /// Drain any pending plugin-stdout lines into chat_messages.
+    /// Called from the main event loop each tick. When the channel
+    /// closes (plugin exited), clear chat_pending so the spinner
+    /// stops and the input bar accepts new turns.
+    fn poll_plugin(&mut self) {
+        let mut closed = false;
+        if let Some(rx) = &self.plugin_output_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(line) => {
+                        // Skip empty lines so the log stays tight.
+                        if !line.trim().is_empty() {
+                            self.chat_messages.push(ChatLine {
+                                who: ChatWho::System,
+                                text: line,
+                            });
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if closed {
+            self.plugin_output_rx = None;
+            self.chat_pending = None;
+        }
     }
 
     fn spawn_chat_turn(&mut self, user_msg: String) {
@@ -2740,6 +2870,20 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled("   Lite dream — quick pass", dim),
         ]),
         Line::from(""),
+        Line::from(Span::styled(" Chat tab plugin slash commands", hdr)),
+        Line::from(vec![
+            Span::styled("   /code <prompt>", kbd),
+            Span::styled("   exec kannaka-code (Rust agentic CLI)", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   /topus <prompt>", kbd),
+            Span::styled("  exec kannaktopus (multi-LLM orchestrator)", dim),
+        ]),
+        Line::from(Span::styled(
+            "   plugin stdout streams inline into chat as it runs",
+            dim,
+        )),
+        Line::from(""),
         Line::from(Span::styled(" Bus subject colors", hdr)),
         Line::from(vec![
             Span::styled("   ●", Style::default().fg(ACCENT)),
@@ -2900,6 +3044,10 @@ fn main() -> io::Result<()> {
 
         // Drain the live NATS bus stream (no-op until user opens Bus tab).
         app.poll_bus();
+
+        // Drain streaming stdout of any active /code or /topus plugin
+        // invocation (no-op when no plugin is running).
+        app.poll_plugin();
 
         // Auto-refresh status every 5s when on the Status tab
         if app.active_tab == 1 && app.last_status_poll.elapsed() > Duration::from_secs(5) {
