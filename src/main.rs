@@ -553,12 +553,15 @@ impl App {
                 }
             }
         }
-        // Fallback: the known release path
-        let release = dirs::home_dir()
-            .map(|h| h.join("Source/kannaka-memory/target/release/kannaka.exe"))
-            .unwrap_or_default();
-        if release.exists() {
-            return release.to_string_lossy().to_string();
+        // Fallback: the known release path (check Windows .exe then bare name).
+        if let Some(home) = dirs::home_dir() {
+            let base = home.join("Source/kannaka-memory/target/release");
+            for name in &["kannaka.exe", "kannaka"] {
+                let candidate = base.join(name);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
         }
         // Last resort: rely on PATH
         "kannaka".to_string()
@@ -1263,7 +1266,13 @@ impl App {
         // Pre-flight: if the binary isn't on PATH, fail fast with a
         // discoverable install hint instead of letting Command::spawn
         // emit a cryptic OS error.
-        if std::process::Command::new(binary).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        if std::process::Command::new(binary)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
             self.chat_messages.push(ChatLine {
                 who: ChatWho::System,
                 text: format!(
