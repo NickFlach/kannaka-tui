@@ -1604,11 +1604,13 @@ impl App {
             (_, KeyCode::F(1)) => self.show_help = true,
 
             // Tab switching
-            (KeyModifiers::NONE, KeyCode::Tab) | (KeyModifiers::NONE, KeyCode::BackTab) => {
+            (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.active_tab = (self.active_tab + 1) % self.tabs.len();
                 self.on_tab_enter();
             }
-            (KeyModifiers::SHIFT, KeyCode::BackTab) => {
+            // Most terminals deliver Shift+Tab as BackTab with NONE modifier;
+            // also accept SHIFT+BackTab for terminals that set the modifier.
+            (KeyModifiers::NONE, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::BackTab) => {
                 if self.active_tab == 0 {
                     self.active_tab = self.tabs.len() - 1;
                 } else {
