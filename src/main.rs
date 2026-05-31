@@ -553,12 +553,15 @@ impl App {
                 }
             }
         }
-        // Fallback: the known release path
-        let release = dirs::home_dir()
-            .map(|h| h.join("Source/kannaka-memory/target/release/kannaka.exe"))
-            .unwrap_or_default();
-        if release.exists() {
-            return release.to_string_lossy().to_string();
+        // Fallback: the known release path (check Windows .exe then bare name).
+        if let Some(home) = dirs::home_dir() {
+            let base = home.join("Source/kannaka-memory/target/release");
+            for name in &["kannaka.exe", "kannaka"] {
+                let candidate = base.join(name);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
         }
         // Last resort: rely on PATH
         "kannaka".to_string()
