@@ -1266,7 +1266,13 @@ impl App {
         // Pre-flight: if the binary isn't on PATH, fail fast with a
         // discoverable install hint instead of letting Command::spawn
         // emit a cryptic OS error.
-        if std::process::Command::new(binary).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        if std::process::Command::new(binary)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
             self.chat_messages.push(ChatLine {
                 who: ChatWho::System,
                 text: format!(
