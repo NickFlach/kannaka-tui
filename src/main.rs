@@ -1799,8 +1799,6 @@ fn render_memory_tab(f: &mut Frame, app: &App, area: Rect) {
         .rev()
         .skip(app.scroll_offset)
         .take(area.height as usize)
-        .collect::<Vec<_>>()
-        .into_iter()
         .rev()
         .map(|m| {
             let (prefix, style) = match m.role {
@@ -2340,8 +2338,6 @@ fn render_bus_tab(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .rev()
         .take(body_height.max(1))
-        .collect::<Vec<_>>()
-        .into_iter()
         .rev()
         .map(|line| {
             let color = bus_subject_color(&line.subject);
