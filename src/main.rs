@@ -519,10 +519,9 @@ impl App {
         let (tx, rx) = mpsc::channel::<Result<String, String>>();
         self.dream_trigger_rx = Some(rx);
         let bin = self.kannaka_bin.clone();
-        let mode_for_thread = mode.clone();
         std::thread::spawn(move || {
             let output = Command::new(&bin)
-                .args(["dream", "--mode", &mode_for_thread])
+                .args(["dream", "--mode", &mode])
                 .env("KANNAKA_QUIET", "1")
                 .output();
             let result = match output {
@@ -1995,19 +1994,19 @@ fn render_status_tab(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  Total Memories:  ", Style::default().fg(DIM)),
-            Span::styled(format!("{}", status.memories), Style::default().fg(TEXT)),
+            Span::styled(status.memories.to_string(), Style::default().fg(TEXT)),
         ]),
         Line::from(vec![
             Span::styled("  Active Memories: ", Style::default().fg(DIM)),
-            Span::styled(format!("{}", status.active), Style::default().fg(SUCCESS)),
+            Span::styled(status.active.to_string(), Style::default().fg(SUCCESS)),
         ]),
         Line::from(vec![
             Span::styled("  Clusters:        ", Style::default().fg(DIM)),
-            Span::styled(format!("{}", status.clusters), Style::default().fg(INFO)),
+            Span::styled(status.clusters.to_string(), Style::default().fg(INFO)),
         ]),
         Line::from(vec![
             Span::styled("  Skip Links:      ", Style::default().fg(DIM)),
-            Span::styled(format!("{}", status.links), Style::default().fg(ACCENT)),
+            Span::styled(status.links.to_string(), Style::default().fg(ACCENT)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
