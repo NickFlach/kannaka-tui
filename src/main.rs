@@ -1052,21 +1052,12 @@ impl App {
         // Parse the command. If nothing matches, default to chat — the agent
         // can call recall/remember/observe tools itself when the conversation
         // warrants. The TUI is a chat surface first, command surface second.
-        if cmd_input.starts_with("remember ") {
-            let text = cmd_input.strip_prefix("remember ").unwrap().trim();
-            let text = text.trim_matches('"').to_string();
-            self.execute_remember(&text);
-        } else if cmd_input.starts_with("recall ") {
-            let query = cmd_input.strip_prefix("recall ").unwrap().trim();
-            let query = query.trim_matches('"').to_string();
-            self.execute_recall(&query);
-        } else if cmd_input.starts_with("forget ") {
-            let id = cmd_input
-                .strip_prefix("forget ")
-                .unwrap()
-                .trim()
-                .to_string();
-            self.execute_forget(&id);
+        if let Some(text) = cmd_input.strip_prefix("remember ") {
+            self.execute_remember(text.trim().trim_matches('"'));
+        } else if let Some(query) = cmd_input.strip_prefix("recall ") {
+            self.execute_recall(query.trim().trim_matches('"'));
+        } else if let Some(id) = cmd_input.strip_prefix("forget ") {
+            self.execute_forget(id.trim());
         } else if cmd_input == "dream" || cmd_input.starts_with("dream ") {
             self.execute_dream();
         } else if cmd_input == "status" || cmd_input == "observe" {
@@ -1093,9 +1084,8 @@ impl App {
                 // --secs 60 has comfortable headroom.
                 self.execute_passthrough(&format!("hear {}", rest), &args, 300);
             }
-        } else if cmd_input.starts_with("ask ") {
-            let q = cmd_input.strip_prefix("ask ").unwrap().trim();
-            let q = q.trim_matches('"');
+        } else if let Some(q) = cmd_input.strip_prefix("ask ") {
+            let q = q.trim().trim_matches('"');
             // ask runs through Anthropic; budget 10 min like the radio's
             // peace-oration path so transient overload retries fit.
             self.execute_passthrough(
@@ -1103,15 +1093,11 @@ impl App {
                 &["ask", "--no-tools", "--quiet-tools", q],
                 600,
             );
-        } else if cmd_input.starts_with("search ") {
-            let q = cmd_input
-                .strip_prefix("search ")
-                .unwrap()
-                .trim()
-                .trim_matches('"');
+        } else if let Some(q) = cmd_input.strip_prefix("search ") {
+            let q = q.trim().trim_matches('"');
             self.execute_passthrough(&format!("search \"{}\"", q), &["search", q], 30);
-        } else if cmd_input.starts_with("boost ") {
-            let id = cmd_input.strip_prefix("boost ").unwrap().trim();
+        } else if let Some(id) = cmd_input.strip_prefix("boost ") {
+            let id = id.trim();
             self.execute_passthrough(&format!("boost {}", id), &["boost", id], 30);
         } else if cmd_input == "assess" {
             self.execute_passthrough("assess", &["assess"], 60);
