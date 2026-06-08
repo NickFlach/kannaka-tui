@@ -22,6 +22,7 @@ use ratatui::{
     },
     Frame, Terminal,
 };
+use unicode_width::UnicodeWidthStr;
 use std::collections::VecDeque;
 use std::io;
 use std::io::{BufRead, BufReader};
@@ -2764,8 +2765,11 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let input_widget = Paragraph::new(input_line).block(input_block);
     f.render_widget(input_widget, area);
 
-    // Place cursor
-    f.set_cursor_position((area.x + 4 + app.cursor_pos as u16, area.y + 1));
+    // Place cursor: use display-column width, not byte offset.
+    // cursor_pos is a byte index; for a terminal we need the visual width
+    // of the characters before it (ASCII=1col, CJK=2col, emoji=2col, etc).
+    let display_col = UnicodeWidthStr::width(&app.input[..app.cursor_pos]) as u16;
+    f.set_cursor_position((area.x + 4 + display_col, area.y + 1));
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {

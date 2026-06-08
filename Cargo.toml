@@ -27,3 +27,6 @@ chrono = "0.4"
 # ~/.kannaka/config.toml resolution + display-name parse
 dirs = "5"
 toml = "0.8"
+
+# Cursor display-column computation (already in the dep tree via ratatui)
+unicode-width = "0.2"
