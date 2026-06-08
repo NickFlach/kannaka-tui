@@ -1617,23 +1617,35 @@ impl App {
             (_, KeyCode::Enter) => self.submit_input(),
             (_, KeyCode::Char(c)) => {
                 self.input.insert(self.cursor_pos, c);
-                self.cursor_pos += 1;
+                self.cursor_pos += c.len_utf8();
             }
             // Cursor edit keys — guards keep behavior identical to the
             // pre-collapse `if cond { ... }` body (no-op at boundaries).
             // Falls through to the `_ => {}` catch-all if guard is false.
             (_, KeyCode::Backspace) if self.cursor_pos > 0 => {
-                self.cursor_pos -= 1;
-                self.input.remove(self.cursor_pos);
+                let prev = self.input[..self.cursor_pos]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.input.remove(prev);
+                self.cursor_pos = prev;
             }
             (_, KeyCode::Delete) if self.cursor_pos < self.input.len() => {
                 self.input.remove(self.cursor_pos);
             }
             (_, KeyCode::Left) if self.cursor_pos > 0 => {
-                self.cursor_pos -= 1;
+                self.cursor_pos = self.input[..self.cursor_pos]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
             }
             (_, KeyCode::Right) if self.cursor_pos < self.input.len() => {
-                self.cursor_pos += 1;
+                self.cursor_pos += self.input[self.cursor_pos..]
+                    .chars()
+                    .next()
+                    .map_or(0, |c| c.len_utf8());
             }
             (_, KeyCode::Home) => self.cursor_pos = 0,
             (_, KeyCode::End) => self.cursor_pos = self.input.len(),
