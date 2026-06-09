@@ -2306,7 +2306,17 @@ fn render_chat_tab(f: &mut Frame, app: &App, area: Rect) {
         " Chat "
     };
 
-    let para = Paragraph::new(lines)
+    // Mirror the memory tab's offset-from-end pattern so PageUp=older,
+    // PageDown=newer — the same semantic as every other scrollable tab.
+    let body_height = area.height.saturating_sub(2) as usize;
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .rev()
+        .skip(app.scroll_offset)
+        .take(body_height)
+        .rev()
+        .collect();
+    let para = Paragraph::new(visible)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2317,8 +2327,7 @@ fn render_chat_tab(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset as u16, 0));
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
