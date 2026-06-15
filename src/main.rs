@@ -29,6 +29,17 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Translate a CHAR index into a BYTE offset within `s`. The input box
+/// tracks the cursor as a char index (one step per keystroke), but
+/// `String::insert`/`remove` take byte offsets — calling them with a
+/// char index panics the moment the buffer holds multi-byte UTF-8.
+/// A char index at or past the end maps to `s.len()` (the tail).
+fn byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map_or(s.len(), |(b, _)| b)
+}
+
 // ---------------------------------------------------------------------------
 // Colour palette — the Kannaka brand
 // ---------------------------------------------------------------------------
@@ -50,6 +61,14 @@ const DIM: Color = Color::Rgb(102, 102, 102);
 struct Message {
     role: Role,
     content: String,
+}
+
+/// Result of an off-thread remember/recall/forget command. The worker
+/// builds the message lines to append and flags whether the memory state
+/// changed (so the event loop refreshes the observe view).
+struct CmdResult {
+    messages: Vec<Message>,
+    refresh_observe: bool,
 }
 
 #[derive(Clone)]
@@ -144,10 +163,41 @@ struct App {
     /// `/topus`). poll_plugin drains lines into chat_messages each
     /// tick; channel close → clear chat_pending so the spinner stops.
     plugin_output_rx: Option<mpsc::Receiver<String>>,
+    /// In-flight remember/recall/forget worker result. These commands
+    /// used to call `Command::output()` on the UI thread and froze the
+    /// render loop for seconds; now they run on a worker and report back
+    /// here, drained each tick by `poll_cmd`.
+    cmd_pending: Option<mpsc::Receiver<CmdResult>>,
+    /// Process handles for the children whose `Child` lives inside a
+    /// worker thread (chat REPL, one-shot plugin). The worker stashes the
+    /// `Child` here right after spawn so the teardown in `main` can
+    /// kill()/wait() them — otherwise they outlive the TUI. The bus child
+    /// is reaped directly via `bus_child`.
+    chat_child_proc: ChildHandle,
+    plugin_child_proc: ChildHandle,
+}
+
+/// Shared slot holding a spawned `Child` so the main thread can reap a
+/// process whose `Child` is otherwise owned by a worker thread.
+type ChildHandle = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+
+/// Kill + wait the child in a shared handle, if present. Used on quit so
+/// no background `kannaka` process leaks past the TUI.
+fn reap_handle(h: &ChildHandle) {
+    if let Ok(mut guard) = h.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 const BUS_BACKLOG_CAP: usize = 500;
 const DREAM_HISTORY_CAP: usize = 30;
+/// Cap on the Memory-tab message log. Like `bus_lines`/`dream_history`,
+/// `messages` otherwise grows unbounded across a long session; trim the
+/// oldest entries past this many.
+const MESSAGES_CAP: usize = 1000;
 /// Agents not heard from in this window get rendered as ghost outlines
 /// instead of solid markers on the Constellation tab.
 const AGENT_FRESH_WINDOW: Duration = Duration::from_secs(120);
@@ -310,6 +360,9 @@ impl App {
             dream_run: DreamRunState::Idle,
             dream_trigger_rx: None,
             plugin_output_rx: None,
+            cmd_pending: None,
+            chat_child_proc: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            plugin_child_proc: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -710,7 +763,7 @@ impl App {
                     self.status_pending = None;
                 }
                 Ok(Err(e)) => {
-                    self.messages.push(Message {
+                    self.push_message(Message {
                         role: Role::Error,
                         content: e,
                     });
@@ -732,7 +785,7 @@ impl App {
                     self.observe_pending = None;
                 }
                 Ok(Err(e)) => {
-                    self.messages.push(Message {
+                    self.push_message(Message {
                         role: Role::Error,
                         content: e,
                     });
@@ -746,99 +799,152 @@ impl App {
         }
     }
 
-    fn execute_remember(&mut self, text: &str) {
-        self.messages.push(Message {
-            role: Role::User,
-            content: format!("remember \"{}\"", text),
-        });
-
-        let output = Command::new(&self.kannaka_bin)
-            .args(["remember", text])
-            .env("KANNAKA_QUIET", "1")
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                self.messages.push(Message {
-                    role: Role::Result,
-                    content: format!("Stored (id: {})", id),
-                });
-                // Refresh memories list
-                self.load_observe();
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Error: {}", stderr.trim()),
-                });
-            }
-            Err(e) => {
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Failed to run kannaka: {}", e),
-                });
-            }
+    /// Append to the Memory-tab message log, trimming the oldest entries
+    /// so it never grows past `MESSAGES_CAP`. All log writes should go
+    /// through here rather than `self.messages.push` directly.
+    fn push_message(&mut self, msg: Message) {
+        self.messages.push(msg);
+        if self.messages.len() > MESSAGES_CAP {
+            let overflow = self.messages.len() - MESSAGES_CAP;
+            self.messages.drain(0..overflow);
         }
     }
 
+    /// Guard so only one remember/recall/forget runs at a time — they
+    /// share the single `cmd_pending` channel. Returns true (and pushes a
+    /// notice) if one is already in flight.
+    fn cmd_busy(&mut self) -> bool {
+        if self.cmd_pending.is_some() {
+            self.push_message(Message {
+                role: Role::System,
+                content: "A memory command is already running — wait for it to finish.".into(),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn execute_remember(&mut self, text: &str) {
+        self.push_message(Message {
+            role: Role::User,
+            content: format!("remember \"{}\"", text),
+        });
+        if self.cmd_busy() {
+            return;
+        }
+
+        let bin = self.kannaka_bin.clone();
+        let text = text.to_string();
+        let (tx, rx) = mpsc::channel::<CmdResult>();
+        self.cmd_pending = Some(rx);
+        std::thread::spawn(move || {
+            let output = Command::new(&bin)
+                .args(["remember", &text])
+                .env("KANNAKA_QUIET", "1")
+                .output();
+            let result = match output {
+                Ok(out) if out.status.success() => {
+                    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Result,
+                            content: format!("Stored (id: {})", id),
+                        }],
+                        refresh_observe: true,
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Error,
+                            content: format!("Error: {}", stderr.trim()),
+                        }],
+                        refresh_observe: false,
+                    }
+                }
+                Err(e) => CmdResult {
+                    messages: vec![Message {
+                        role: Role::Error,
+                        content: format!("Failed to run kannaka: {}", e),
+                    }],
+                    refresh_observe: false,
+                },
+            };
+            let _ = tx.send(result);
+        });
+    }
+
     fn execute_recall(&mut self, query: &str) {
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::User,
             content: format!("recall \"{}\"", query),
         });
+        if self.cmd_busy() {
+            return;
+        }
 
-        let start = Instant::now();
-        let output = Command::new(&self.kannaka_bin)
-            .args(["recall", query, "--top-k", "5"])
-            .env("KANNAKA_QUIET", "1")
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let elapsed = start.elapsed();
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-                    self.messages.push(Message {
-                        role: Role::System,
-                        content: format!(
-                            "{} results ({:.0}ms):",
-                            results.len(),
-                            elapsed.as_secs_f64() * 1000.0
-                        ),
-                    });
-                    for (i, r) in results.iter().enumerate() {
-                        let content = r["content"].as_str().unwrap_or("?");
-                        let sim = r["similarity"].as_f64().unwrap_or(0.0);
-                        // Truncate content for display
-                        let preview: String = content.chars().take(60).collect();
-                        self.messages.push(Message {
+        let bin = self.kannaka_bin.clone();
+        let query = query.to_string();
+        let (tx, rx) = mpsc::channel::<CmdResult>();
+        self.cmd_pending = Some(rx);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let output = Command::new(&bin)
+                .args(["recall", &query, "--top-k", "5"])
+                .env("KANNAKA_QUIET", "1")
+                .output();
+            let mut messages = Vec::new();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let elapsed = start.elapsed();
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                        messages.push(Message {
+                            role: Role::System,
+                            content: format!(
+                                "{} results ({:.0}ms):",
+                                results.len(),
+                                elapsed.as_secs_f64() * 1000.0
+                            ),
+                        });
+                        for (i, r) in results.iter().enumerate() {
+                            let content = r["content"].as_str().unwrap_or("?");
+                            let sim = r["similarity"].as_f64().unwrap_or(0.0);
+                            // Truncate content for display
+                            let preview: String = content.chars().take(60).collect();
+                            messages.push(Message {
+                                role: Role::Result,
+                                content: format!("  {}. {} ({:.2})", i + 1, preview, sim),
+                            });
+                        }
+                    } else {
+                        messages.push(Message {
                             role: Role::Result,
-                            content: format!("  {}. {} ({:.2})", i + 1, preview, sim),
+                            content: stdout.trim().to_string(),
                         });
                     }
-                } else {
-                    self.messages.push(Message {
-                        role: Role::Result,
-                        content: stdout.trim().to_string(),
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    messages.push(Message {
+                        role: Role::Error,
+                        content: format!("Error: {}", stderr.trim()),
+                    });
+                }
+                Err(e) => {
+                    messages.push(Message {
+                        role: Role::Error,
+                        content: format!("Failed: {}", e),
                     });
                 }
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Error: {}", stderr.trim()),
-                });
-            }
-            Err(e) => {
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Failed: {}", e),
-                });
-            }
-        }
+            let _ = tx.send(CmdResult {
+                messages,
+                refresh_observe: false,
+            });
+        });
     }
 
     /// Kick off a dream from the command bar (`dream` or `dream lite`).
@@ -847,17 +953,17 @@ impl App {
     /// the duration of consolidation (~30s).
     fn execute_dream(&mut self) {
         if self.dream_trigger_rx.is_some() {
-            self.messages.push(Message {
+            self.push_message(Message {
                 role: Role::System,
                 content: "A dream is already running — wait for it to finish.".into(),
             });
             return;
         }
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::User,
             content: "dream --mode deep".to_string(),
         });
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::System,
             content: "Dream cycle started in background — Dreams tab for progress.".to_string(),
         });
@@ -868,37 +974,75 @@ impl App {
     }
 
     fn execute_forget(&mut self, query: &str) {
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::User,
             content: format!("forget \"{}\"", query),
         });
+        if self.cmd_busy() {
+            return;
+        }
 
-        let output = Command::new(&self.kannaka_bin)
-            .args(["forget", query])
-            .env("KANNAKA_QUIET", "1")
-            .output();
+        let bin = self.kannaka_bin.clone();
+        let query = query.to_string();
+        let (tx, rx) = mpsc::channel::<CmdResult>();
+        self.cmd_pending = Some(rx);
+        std::thread::spawn(move || {
+            let output = Command::new(&bin)
+                .args(["forget", &query])
+                .env("KANNAKA_QUIET", "1")
+                .output();
+            let result = match output {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Result,
+                            content: stdout.trim().to_string(),
+                        }],
+                        refresh_observe: true,
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Error,
+                            content: format!("Error: {}", stderr.trim()),
+                        }],
+                        refresh_observe: false,
+                    }
+                }
+                Err(e) => CmdResult {
+                    messages: vec![Message {
+                        role: Role::Error,
+                        content: format!("Failed: {}", e),
+                    }],
+                    refresh_observe: false,
+                },
+            };
+            let _ = tx.send(result);
+        });
+    }
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                self.messages.push(Message {
-                    role: Role::Result,
-                    content: stdout.trim().to_string(),
-                });
-                self.load_observe();
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Error: {}", stderr.trim()),
-                });
-            }
-            Err(e) => {
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: format!("Failed: {}", e),
-                });
+    /// Drain a completed remember/recall/forget worker. Non-blocking;
+    /// called every event-loop tick.
+    fn poll_cmd(&mut self) {
+        if let Some(rx) = &self.cmd_pending {
+            match rx.try_recv() {
+                Ok(res) => {
+                    for m in res.messages {
+                        self.push_message(m);
+                    }
+                    let refresh = res.refresh_observe;
+                    self.cmd_pending = None;
+                    if refresh {
+                        self.load_observe();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.cmd_pending = None;
+                }
             }
         }
     }
@@ -911,11 +1055,11 @@ impl App {
     // command. Keeps the TUI the canonical surface without writing a
     // dedicated handler for every subcommand.
     fn execute_passthrough(&mut self, label: &str, args: &[&str], timeout_secs: u64) {
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::User,
             content: label.to_string(),
         });
-        self.messages.push(Message {
+        self.push_message(Message {
             role: Role::System,
             content: format!("Running... (up to {}s)", timeout_secs),
         });
@@ -964,7 +1108,7 @@ impl App {
             Ok(Ok(out)) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let body = stdout.trim();
-                self.messages.push(Message {
+                self.push_message(Message {
                     role: Role::Result,
                     content: if body.is_empty() {
                         "(no output)".into()
@@ -976,16 +1120,16 @@ impl App {
             }
             Ok(Ok(out)) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                self.messages.push(Message {
+                self.push_message(Message {
                     role: Role::Error,
                     content: format!("Error: {}", stderr.trim()),
                 });
             }
-            Ok(Err(msg)) => self.messages.push(Message {
+            Ok(Err(msg)) => self.push_message(Message {
                 role: Role::Error,
                 content: msg,
             }),
-            Err(_) => self.messages.push(Message {
+            Err(_) => self.push_message(Message {
                 role: Role::Error,
                 content: "thread panicked".into(),
             }),
@@ -1062,7 +1206,7 @@ impl App {
         } else if cmd_input == "status" || cmd_input == "observe" {
             self.load_status();
             self.load_observe();
-            self.messages.push(Message {
+            self.push_message(Message {
                 role: Role::System,
                 content: "Status refreshed.".to_string(),
             });
@@ -1070,7 +1214,7 @@ impl App {
             // hear <file-or-url> [--secs N]
             let rest = cmd_input.strip_prefix("hear").unwrap_or("").trim();
             if rest.is_empty() {
-                self.messages.push(Message {
+                self.push_message(Message {
                     role: Role::Error,
                     content: "Usage: hear <file-or-url> [--secs N]".into(),
                 });
@@ -1165,6 +1309,7 @@ impl App {
         self.chat_child_rx = Some(rx);
         let bin = self.kannaka_bin.clone();
         let tx_spawn = tx.clone();
+        let proc_slot = std::sync::Arc::clone(&self.chat_child_proc);
         // Spawn-and-attach happens on a worker so the TUI doesn't block
         // for the ~15s HRM load. The worker:
         //   1. Spawns `kannaka chat --json`
@@ -1212,8 +1357,16 @@ impl App {
                     }
                 });
             }
+            // Take stdout before handing the Child off to the shared slot
+            // so the reader below still owns the pipe.
+            let stdout = child.stdout.take();
+            // Stash the Child so the main thread can kill()/wait() it on
+            // quit — otherwise this `kannaka chat` process leaks.
+            if let Ok(mut guard) = proc_slot.lock() {
+                *guard = Some(child);
+            }
             // Stdout reader — parse NDJSON and forward each turn response.
-            if let Some(stdout) = child.stdout.take() {
+            if let Some(stdout) = stdout {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1275,6 +1428,7 @@ impl App {
         // the spinner animation kicks on. Replace with a real per-
         // plugin tracking field if you need to distinguish later.
         self.chat_pending = Some(std::sync::mpsc::channel().1);
+        let proc_slot = std::sync::Arc::clone(&self.plugin_child_proc);
 
         std::thread::spawn(move || {
             let mut child = match std::process::Command::new(&bin)
@@ -1289,7 +1443,13 @@ impl App {
                     return;
                 }
             };
-            if let Some(stdout) = child.stdout.take() {
+            let stdout = child.stdout.take();
+            // Stash the Child so quit-time teardown can reap an in-flight
+            // plugin run instead of leaking it.
+            if let Ok(mut guard) = proc_slot.lock() {
+                *guard = Some(child);
+            }
+            if let Some(stdout) = stdout {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     if tx.send(line).is_err() {
@@ -1297,7 +1457,13 @@ impl App {
                     }
                 }
             }
-            let _ = child.wait();
+            // Reap the child and clear the slot so a finished run doesn't
+            // leave a stale (already-exited) handle for teardown to wait on.
+            if let Ok(mut guard) = proc_slot.lock() {
+                if let Some(mut child) = guard.take() {
+                    let _ = child.wait();
+                }
+            }
         });
 
         // Stash the receiver on a per-plugin field so poll() can drain
@@ -1613,10 +1779,14 @@ impl App {
                 self.on_tab_enter();
             }
 
-            // Input handling
+            // Input handling. `cursor_pos` is a CHAR index, not a byte
+            // offset — translate to a byte boundary before mutating
+            // `self.input` so multi-byte UTF-8 (emoji, accents) never
+            // splits a code point and panics.
             (_, KeyCode::Enter) => self.submit_input(),
             (_, KeyCode::Char(c)) => {
-                self.input.insert(self.cursor_pos, c);
+                let at = byte_offset(&self.input, self.cursor_pos);
+                self.input.insert(at, c);
                 self.cursor_pos += 1;
             }
             // Cursor edit keys — guards keep behavior identical to the
@@ -1624,19 +1794,21 @@ impl App {
             // Falls through to the `_ => {}` catch-all if guard is false.
             (_, KeyCode::Backspace) if self.cursor_pos > 0 => {
                 self.cursor_pos -= 1;
-                self.input.remove(self.cursor_pos);
+                let at = byte_offset(&self.input, self.cursor_pos);
+                self.input.remove(at);
             }
-            (_, KeyCode::Delete) if self.cursor_pos < self.input.len() => {
-                self.input.remove(self.cursor_pos);
+            (_, KeyCode::Delete) if self.cursor_pos < self.input.chars().count() => {
+                let at = byte_offset(&self.input, self.cursor_pos);
+                self.input.remove(at);
             }
             (_, KeyCode::Left) if self.cursor_pos > 0 => {
                 self.cursor_pos -= 1;
             }
-            (_, KeyCode::Right) if self.cursor_pos < self.input.len() => {
+            (_, KeyCode::Right) if self.cursor_pos < self.input.chars().count() => {
                 self.cursor_pos += 1;
             }
             (_, KeyCode::Home) => self.cursor_pos = 0,
-            (_, KeyCode::End) => self.cursor_pos = self.input.len(),
+            (_, KeyCode::End) => self.cursor_pos = self.input.chars().count(),
 
             // Scroll history — no-op when history is empty
             (_, KeyCode::Up) if !self.history.is_empty() => {
@@ -1647,14 +1819,14 @@ impl App {
                 };
                 self.history_idx = Some(idx);
                 self.input = self.history[idx].clone();
-                self.cursor_pos = self.input.len();
+                self.cursor_pos = self.input.chars().count();
             }
             (_, KeyCode::Down) => {
                 if let Some(idx) = self.history_idx {
                     if idx + 1 < self.history.len() {
                         self.history_idx = Some(idx + 1);
                         self.input = self.history[idx + 1].clone();
-                        self.cursor_pos = self.input.len();
+                        self.cursor_pos = self.input.chars().count();
                     } else {
                         self.history_idx = None;
                         self.input.clear();
@@ -2764,8 +2936,13 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let input_widget = Paragraph::new(input_line).block(input_block);
     f.render_widget(input_widget, area);
 
-    // Place cursor
-    f.set_cursor_position((area.x + 4 + app.cursor_pos as u16, area.y + 1));
+    // Place cursor. `cursor_pos` is a char index; the prompt prefix
+    // " > " plus the left border put column 0 of the input at area.x + 4.
+    // Clamp to the box interior (one cell inside the right border) so a
+    // long line never parks the cursor past the widget and out of `area`.
+    let cursor_col = (area.x + 4).saturating_add(app.cursor_pos as u16);
+    let max_col = area.x + area.width.saturating_sub(2);
+    f.set_cursor_position((cursor_col.min(max_col), area.y + 1));
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
@@ -2996,6 +3173,16 @@ fn level_color(level: &str) -> Color {
 // ---------------------------------------------------------------------------
 
 fn main() -> io::Result<()> {
+    // Install a panic hook that restores the terminal BEFORE the default
+    // hook prints the backtrace. Without this, a panic while in raw mode +
+    // alt screen leaves the user's terminal wedged (no echo, no prompt).
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -3034,6 +3221,9 @@ fn main() -> io::Result<()> {
         // Drain async status/observe pollers.
         app.poll_async_data();
 
+        // Drain a completed remember/recall/forget worker (no-op when idle).
+        app.poll_cmd();
+
         // Drain the live NATS bus stream (no-op until user opens Bus tab).
         app.poll_bus();
 
@@ -3055,10 +3245,16 @@ fn main() -> io::Result<()> {
     // Restore terminal
     terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    // Reap the bus child so it doesn't outlive the TUI.
+    // Reap every tracked child so none outlive the TUI:
+    //   - bus child (kannaka swarm tail) — owned directly
+    //   - chat child (kannaka chat --json REPL) — owned by its worker
+    //   - plugin child (kannaka-code / kannaktopus) — owned by its worker
+    // Dropping stdin alone doesn't terminate the chat REPL, so kill it.
     if let Some(mut child) = app.bus_child.take() {
         let _ = child.kill();
         let _ = child.wait();
     }
+    reap_handle(&app.chat_child_proc);
+    reap_handle(&app.plugin_child_proc);
     Ok(())
 }
