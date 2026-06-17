@@ -1048,8 +1048,9 @@ impl App {
     }
 
     // Forward an arbitrary kannaka subcommand to the binary and surface its
-    // stdout/stderr in the message log. The label is what we echo back as
-    // the User line; args is what we pass to kannaka after env scrubbing.
+    // stdout/stderr in the message log. Non-blocking — the child runs on a
+    // worker thread and reports back via cmd_pending (same channel as
+    // remember/recall/forget). At most one background command at a time.
     // Used for hear, ask, assess, stats, voice, swarm subcommands, and
     // anything else the user types that we recognize as a real kannaka
     // command. Keeps the TUI the canonical surface without writing a
@@ -1059,81 +1060,107 @@ impl App {
             role: Role::User,
             content: label.to_string(),
         });
+        if self.cmd_busy() {
+            return;
+        }
         self.push_message(Message {
             role: Role::System,
             content: format!("Running... (up to {}s)", timeout_secs),
         });
 
-        // Spawn with a wall-clock timeout so a stuck `ask` (Anthropic
-        // overloaded, network blip) doesn't hang the TUI.
         let bin = self.kannaka_bin.clone();
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let result = std::thread::spawn(move || {
+        let (tx, rx) = mpsc::channel::<CmdResult>();
+        self.cmd_pending = Some(rx);
+        std::thread::spawn(move || {
             let mut child = match Command::new(&bin)
                 .args(&owned)
                 .env("KANNAKA_QUIET", "1")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
             {
                 Ok(c) => c,
-                Err(e) => return Err(format!("spawn: {}", e)),
+                Err(e) => {
+                    let _ = tx.send(CmdResult {
+                        messages: vec![Message {
+                            role: Role::Error,
+                            content: format!("spawn: {e}"),
+                        }],
+                        refresh_observe: false,
+                    });
+                    return;
+                }
             };
             let start = Instant::now();
             loop {
                 match child.try_wait() {
-                    Ok(Some(_status)) => {
-                        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-                        return Ok(out);
+                    Ok(Some(_)) => {
+                        let res = match child.wait_with_output() {
+                            Ok(out) if out.status.success() => {
+                                let body =
+                                    String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                CmdResult {
+                                    messages: vec![Message {
+                                        role: Role::Result,
+                                        content: if body.is_empty() {
+                                            "(no output)".into()
+                                        } else {
+                                            body
+                                        },
+                                    }],
+                                    refresh_observe: true,
+                                }
+                            }
+                            Ok(out) => {
+                                let stderr =
+                                    String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                CmdResult {
+                                    messages: vec![Message {
+                                        role: Role::Error,
+                                        content: format!("Error: {stderr}"),
+                                    }],
+                                    refresh_observe: false,
+                                }
+                            }
+                            Err(e) => CmdResult {
+                                messages: vec![Message {
+                                    role: Role::Error,
+                                    content: format!("wait failed: {e}"),
+                                }],
+                                refresh_observe: false,
+                            },
+                        };
+                        let _ = tx.send(res);
+                        return;
                     }
                     Ok(None) => {
                         if start.elapsed() > Duration::from_secs(timeout_secs) {
                             let _ = child.kill();
-                            return Err(format!("timeout after {}s", timeout_secs));
+                            let _ = tx.send(CmdResult {
+                                messages: vec![Message {
+                                    role: Role::Error,
+                                    content: format!("timeout after {timeout_secs}s"),
+                                }],
+                                refresh_observe: false,
+                            });
+                            return;
                         }
                         std::thread::sleep(Duration::from_millis(150));
                     }
-                    Err(e) => return Err(format!("wait: {}", e)),
+                    Err(e) => {
+                        let _ = tx.send(CmdResult {
+                            messages: vec![Message {
+                                role: Role::Error,
+                                content: format!("wait: {e}"),
+                            }],
+                            refresh_observe: false,
+                        });
+                        return;
+                    }
                 }
             }
-        })
-        .join();
-
-        // Pop the "Running..." line so the result replaces it cleanly.
-        if matches!(self.messages.last().map(|m| &m.role), Some(Role::System)) {
-            self.messages.pop();
-        }
-
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let body = stdout.trim();
-                self.push_message(Message {
-                    role: Role::Result,
-                    content: if body.is_empty() {
-                        "(no output)".into()
-                    } else {
-                        body.into()
-                    },
-                });
-                self.load_observe();
-            }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.push_message(Message {
-                    role: Role::Error,
-                    content: format!("Error: {}", stderr.trim()),
-                });
-            }
-            Ok(Err(msg)) => self.push_message(Message {
-                role: Role::Error,
-                content: msg,
-            }),
-            Err(_) => self.push_message(Message {
-                role: Role::Error,
-                content: "thread panicked".into(),
-            }),
-        }
+        });
     }
 
     fn submit_input(&mut self) {
