@@ -490,6 +490,9 @@ const MESSAGES_CAP: usize = 1000;
 /// `messages` are all bounded; `history` was the only unbounded collection.
 /// 500 entries covers any realistic session without truncating useful recall.
 const HISTORY_CAP: usize = 500;
+/// Cap on the Chat-tab conversation log. Without this `chat_messages` grows
+/// without bound while every other collection in App is already capped.
+const CHAT_MESSAGES_CAP: usize = 500;
 /// Agents not heard from in this window get rendered as ghost outlines
 /// instead of solid markers on the Constellation tab.
 const AGENT_FRESH_WINDOW: Duration = Duration::from_secs(120);
@@ -1487,6 +1490,16 @@ impl App {
         }
     }
 
+    /// Trim the oldest Chat-tab entries if the log has grown past
+    /// `CHAT_MESSAGES_CAP`. Called at the end of every function that pushes
+    /// to `chat_messages` so the vec is bounded across a long session.
+    fn trim_chat_messages(&mut self) {
+        if self.chat_messages.len() > CHAT_MESSAGES_CAP {
+            let overflow = self.chat_messages.len() - CHAT_MESSAGES_CAP;
+            self.chat_messages.drain(0..overflow);
+        }
+    }
+
     /// Guard so only one remember/recall/forget runs at a time — they
     /// share the single `cmd_pending` channel. Returns true (and pushes a
     /// notice) if one is already in flight.
@@ -2161,6 +2174,7 @@ impl App {
         self.cursor_pos = 0;
         // Auto-scroll to bottom
         self.scroll_offset = 0;
+        self.trim_chat_messages();
     }
 
     /// Lazily spawn the persistent `kannaka chat --json` child. The child
@@ -2340,6 +2354,7 @@ impl App {
         // store it inline as a small queue + thread → see poll_plugin
         // for drain logic.
         self.plugin_output_rx = Some(rx);
+        self.trim_chat_messages();
     }
 
     /// Drain any pending plugin-stdout lines into chat_messages.
@@ -2372,6 +2387,7 @@ impl App {
             self.plugin_output_rx = None;
             self.chat_pending = None;
         }
+        self.trim_chat_messages();
     }
 
     fn spawn_chat_turn(&mut self, user_msg: String) {
@@ -2562,6 +2578,7 @@ impl App {
                 }
             }
         }
+        self.trim_chat_messages();
     }
 
     /// Side-effects on entering a tab — kicked off whether the user
