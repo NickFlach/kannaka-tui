@@ -35,9 +35,112 @@ use std::time::{Duration, Instant};
 /// char index panics the moment the buffer holds multi-byte UTF-8.
 /// A char index at or past the end maps to `s.len()` (the tail).
 fn byte_offset(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map_or(s.len(), |(b, _)| b)
+    s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// Run a `kannaka` subprocess to completion with a hard wall-clock
+/// timeout, killing it if it overruns. Returns the captured `Output` or
+/// an error string. Every shellout that runs inside a worker thread goes
+/// through here so a wedged child can never strand its worker (and thus
+/// the in-flight guard that gates the next refresh) forever. The
+/// `KANNAKA_QUIET=1` env keeps the child from polluting stdout with
+/// progress chatter we'd otherwise mis-parse.
+///
+/// NOTE: like the original `execute_passthrough` loop this drains stdout
+/// only after the child exits, so a child that emits more than a pipe
+/// buffer (~64 KiB) without exiting could deadlock — bounded now by the
+/// timeout, which kills it. Callers must therefore only pass commands
+/// with small, bounded output (status/recall/clusters), never `export`.
+fn run_capture(
+    bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .env("KANNAKA_QUIET", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed at '{bin}': {e}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timeout after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+    }
+}
+
+/// One constellation app as reported by `kannaka constellation`. The CLI
+/// prints human-readable lines (`✓ Name   URL` / `✗ Name   URL`) rather
+/// than JSON, so the Cosmos tab parses them by the leading status glyph.
+#[derive(Clone, PartialEq, Eq)]
+struct CosmosApp {
+    name: String,
+    up: bool,
+    url: String,
+}
+
+/// Parse one line of `kannaka constellation` output into a `CosmosApp`.
+/// Returns `None` for the header / divider / blank lines (anything not
+/// led by a ✓ or ✗ glyph). The URL is detected by its `://` scheme so a
+/// multi-word app name with variable padding still splits correctly.
+fn parse_constellation_line(line: &str) -> Option<CosmosApp> {
+    let t = line.trim();
+    let (up, rest) = if let Some(r) = t.strip_prefix('\u{2713}') {
+        (true, r) // ✓
+    } else if let Some(r) = t.strip_prefix('\u{2717}') {
+        (false, r) // ✗
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let (name, url) = match rest.rfind("://") {
+        Some(pos) => {
+            // Walk back from the scheme to the whitespace that starts the
+            // URL token; everything before it is the (possibly multi-word)
+            // app name. Advance past the FULL width of that whitespace char
+            // (`i + c.len_utf8()`, not `i + 1`) so a multibyte separator
+            // (NBSP, ideographic space) can't land `url_start` inside a
+            // code point and panic the byte slices below.
+            let url_start = rest[..pos]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            (
+                rest[..url_start].trim().to_string(),
+                rest[url_start..].trim().to_string(),
+            )
+        }
+        None => (rest.to_string(), String::new()),
+    };
+    Some(CosmosApp { name, up, url })
+}
+
+/// Trim `kannaka radio` stdout to its non-empty display lines (now
+/// playing / station / listeners). Rendered as-is on the Cosmos tab.
+fn clean_radio_lines(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .take(4)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +204,8 @@ struct Status {
 // flags the Receiver<Result<(...), String>> pile-up otherwise.
 type StatusRx = mpsc::Receiver<Result<Status, String>>;
 type ObserveRx = mpsc::Receiver<Result<(u64, Vec<MemoryEntry>), String>>;
+/// Cosmos poll result: (constellation apps, radio now-playing lines).
+type CosmosRx = mpsc::Receiver<Result<(Vec<CosmosApp>, Vec<String>), String>>;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -175,6 +280,19 @@ struct App {
     /// is reaped directly via `bus_child`.
     chat_child_proc: ChildHandle,
     plugin_child_proc: ChildHandle,
+    /// In-flight result of a one-shot passthrough command (ask, hear,
+    /// search, assess, voice, swarm, relate, …). Was a blocking
+    /// `thread::spawn(...).join()` on the UI thread that froze the entire
+    /// TUI for up to the command's timeout; now the worker reports back
+    /// here and `poll_passthrough` drains it each tick.
+    passthrough_pending: Option<mpsc::Receiver<CmdResult>>,
+    // ---- Cosmos tab — constellation-wide health (kannaka constellation +
+    // kannaka radio). One-shot polled view; no long-running child.
+    cosmos_apps: Vec<CosmosApp>,
+    cosmos_radio: Vec<String>,
+    cosmos_pending: Option<CosmosRx>,
+    cosmos_error: Option<String>,
+    cosmos_last_load: Instant,
 }
 
 /// Shared slot holding a spawned `Child` so the main thread can reap a
@@ -201,6 +319,14 @@ const MESSAGES_CAP: usize = 1000;
 /// Agents not heard from in this window get rendered as ghost outlines
 /// instead of solid markers on the Constellation tab.
 const AGENT_FRESH_WINDOW: Duration = Duration::from_secs(120);
+/// Agents silent past this (10× the fresh window) are dropped from the
+/// map entirely. Without this the `agents` HashMap grows unbounded across
+/// a long session as constellation membership churns — every other buffer
+/// in this file is capped, so this one is too.
+const AGENT_EVICT_WINDOW: Duration = Duration::from_secs(1200);
+/// Re-poll the Cosmos tab (constellation + radio health) no more often
+/// than this when the tab is focused.
+const COSMOS_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Handle to the spawned `kannaka chat --json` child. Stdin is held here
 /// so the main thread can write user turns into it; stdout/stderr are
@@ -318,7 +444,15 @@ impl App {
             // Bus sits between Status and Constellation as the live
             // constellation pulse view.
             active_tab: 5,
-            tabs: vec!["Memory", "Status", "Bus", "Constellation", "Dreams", "Chat"],
+            tabs: vec![
+                "Memory",
+                "Status",
+                "Bus",
+                "Constellation",
+                "Dreams",
+                "Chat",
+                "Cosmos",
+            ],
             input: String::new(),
             cursor_pos: 0,
             messages: vec![Message {
@@ -363,6 +497,13 @@ impl App {
             cmd_pending: None,
             chat_child_proc: std::sync::Arc::new(std::sync::Mutex::new(None)),
             plugin_child_proc: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            passthrough_pending: None,
+            cosmos_apps: Vec::new(),
+            cosmos_radio: Vec::new(),
+            cosmos_pending: None,
+            cosmos_error: None,
+            // Force an initial load the first time the Cosmos tab opens.
+            cosmos_last_load: Instant::now() - COSMOS_POLL_INTERVAL,
         }
     }
 
@@ -459,6 +600,21 @@ impl App {
         });
     }
 
+    /// Tear down a dead/failed bus stream and start a fresh one. Bound to
+    /// `r` on the Bus tab when the stream has Failed — a manual recovery
+    /// path so a transient NATS blip doesn't require restarting the TUI.
+    fn restart_bus(&mut self) {
+        if let Some(mut child) = self.bus_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.bus_rx = None;
+        self.agent_rx = None;
+        self.dream_rx = None;
+        self.bus_status = BusStatus::Off;
+        self.start_bus();
+    }
+
     /// Drain any new BusLine entries from the worker thread into the
     /// ring buffer. Capped at BUS_BACKLOG_CAP — older lines drop off
     /// the front.
@@ -503,6 +659,14 @@ impl App {
                 }
             }
         }
+
+        // Evict long-silent agents so the map can't grow unbounded as
+        // constellation membership churns over a long session. Stale-but-
+        // recent agents still render dimmed (AGENT_FRESH_WINDOW); only the
+        // truly gone (past AGENT_EVICT_WINDOW) are dropped.
+        let now = Instant::now();
+        self.agents
+            .retain(|_, s| now.duration_since(s.last_seen) < AGENT_EVICT_WINDOW);
 
         // Drain dream events into the rolling history.
         if let Some(rx) = &self.dream_rx {
@@ -573,10 +737,7 @@ impl App {
         self.dream_trigger_rx = Some(rx);
         let bin = self.kannaka_bin.clone();
         std::thread::spawn(move || {
-            let output = Command::new(&bin)
-                .args(["dream", "--mode", &mode])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            let output = run_capture(&bin, &["dream", "--mode", &mode], Duration::from_secs(300));
             let result = match output {
                 Ok(out) if out.status.success() => {
                     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -585,13 +746,22 @@ impl App {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     Err(stderr.trim().to_string())
                 }
-                Err(e) => Err(format!("spawn failed: {e}")),
+                Err(e) => Err(e),
             };
             let _ = tx.send(result);
         });
     }
 
     fn find_kannaka_binary() -> String {
+        // Explicit override wins — the doctrine's adapter seam. Lets the
+        // user point the TUI at any kannaka build (CI, a worktree, a
+        // sibling checkout) without recompiling.
+        if let Ok(p) = std::env::var("KANNAKA_BIN") {
+            let p = p.trim();
+            if !p.is_empty() {
+                return p.to_string();
+            }
+        }
         // Check for release build next to this binary
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -661,15 +831,16 @@ impl App {
             // read fields under .data.X; tolerate the legacy flat
             // shape too in case the kannaka binary is older than
             // v0.6.3 (envelope-aware status landed there).
-            let output = Command::new(&bin)
-                .args(["status", "--envelope"])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            // 60s cap: the first poll runs an eigendecomp over the whole
+            // medium and can take ~30s; a wedged binary past 60s gets
+            // killed so `status_pending` clears instead of blocking every
+            // future refresh forever.
+            let output = run_capture(&bin, &["status", "--envelope"], Duration::from_secs(60));
             let result = match output {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    serde_json::from_str::<serde_json::Value>(&stdout)
-                        .map(|val| {
+                    match serde_json::from_str::<serde_json::Value>(&stdout) {
+                        Ok(val) => {
                             // Envelope detection: schema_version + data present.
                             // Fall back to flat shape so older kannaka binaries
                             // still work (they emit the legacy object directly).
@@ -680,27 +851,36 @@ impl App {
                             } else {
                                 val
                             };
-                            Status {
-                                phi: body["phi"].as_f64().unwrap_or(0.0) as f32,
-                                xi: body["xi"].as_f64().unwrap_or(0.0) as f32,
-                                order: body["mean_order"].as_f64().unwrap_or(0.0) as f32,
-                                memories: body["total_memories"].as_u64().unwrap_or(0),
-                                clusters: body["num_clusters"].as_u64().unwrap_or(0),
-                                links: 0,
-                                level: body["consciousness_level"]
-                                    .as_str()
-                                    .unwrap_or("Unknown")
-                                    .to_string(),
-                                active: body["active_memories"].as_u64().unwrap_or(0),
+                            // Schema-drift guard: if neither of the two core
+                            // fields is present, the binary's status shape
+                            // changed under us — surface that instead of
+                            // rendering a plausible-but-fake all-zero status.
+                            if body.get("phi").is_none() && body.get("total_memories").is_none() {
+                                Err("status schema unrecognized — kannaka binary may be newer or older than this TUI".to_string())
+                            } else {
+                                Ok(Status {
+                                    phi: body["phi"].as_f64().unwrap_or(0.0) as f32,
+                                    xi: body["xi"].as_f64().unwrap_or(0.0) as f32,
+                                    order: body["mean_order"].as_f64().unwrap_or(0.0) as f32,
+                                    memories: body["total_memories"].as_u64().unwrap_or(0),
+                                    clusters: body["num_clusters"].as_u64().unwrap_or(0),
+                                    links: 0,
+                                    level: body["consciousness_level"]
+                                        .as_str()
+                                        .unwrap_or("Unknown")
+                                        .to_string(),
+                                    active: body["active_memories"].as_u64().unwrap_or(0),
+                                })
                             }
-                        })
-                        .map_err(|e| format!("status parse: {e}"))
+                        }
+                        Err(e) => Err(format!("status parse: {e}")),
+                    }
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     Err(format!("status failed: {}", stderr.trim()))
                 }
-                Err(e) => Err(format!("status spawn failed at '{}': {e}", bin)),
+                Err(e) => Err(format!("status {e}")),
             };
             let _ = tx.send(result);
         });
@@ -716,10 +896,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(u64, Vec<MemoryEntry>), String>>();
         self.observe_pending = Some(rx);
         std::thread::spawn(move || {
-            let output = Command::new(&bin)
-                .args(["observe", "--json"])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            let output = run_capture(&bin, &["observe", "--json"], Duration::from_secs(60));
             let result = match output {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -746,8 +923,11 @@ impl App {
                         Err(e) => Err(format!("observe parse: {e}")),
                     }
                 }
-                Ok(_) => Err("observe failed".to_string()),
-                Err(e) => Err(format!("observe spawn failed: {e}")),
+                Ok(out) => Err(format!(
+                    "observe failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Err(e) => Err(format!("observe {e}")),
             };
             let _ = tx.send(result);
         });
@@ -839,10 +1019,7 @@ impl App {
         let (tx, rx) = mpsc::channel::<CmdResult>();
         self.cmd_pending = Some(rx);
         std::thread::spawn(move || {
-            let output = Command::new(&bin)
-                .args(["remember", &text])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            let output = run_capture(&bin, &["remember", &text], Duration::from_secs(60));
             let result = match output {
                 Ok(out) if out.status.success() => {
                     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -891,10 +1068,11 @@ impl App {
         self.cmd_pending = Some(rx);
         std::thread::spawn(move || {
             let start = Instant::now();
-            let output = Command::new(&bin)
-                .args(["recall", &query, "--top-k", "5"])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            let output = run_capture(
+                &bin,
+                &["recall", &query, "--top-k", "5"],
+                Duration::from_secs(60),
+            );
             let mut messages = Vec::new();
             match output {
                 Ok(out) if out.status.success() => {
@@ -987,10 +1165,7 @@ impl App {
         let (tx, rx) = mpsc::channel::<CmdResult>();
         self.cmd_pending = Some(rx);
         std::thread::spawn(move || {
-            let output = Command::new(&bin)
-                .args(["forget", &query])
-                .env("KANNAKA_QUIET", "1")
-                .output();
+            let output = run_capture(&bin, &["forget", &query], Duration::from_secs(60));
             let result = match output {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1059,80 +1234,170 @@ impl App {
             role: Role::User,
             content: label.to_string(),
         });
+        // One passthrough at a time — they share the single
+        // `passthrough_pending` channel. (remember/recall/forget run on
+        // their own `cmd_pending` channel and may overlap with this.)
+        if self.passthrough_pending.is_some() {
+            self.push_message(Message {
+                role: Role::System,
+                content: "Another command is already running — wait for it to finish.".into(),
+            });
+            return;
+        }
         self.push_message(Message {
             role: Role::System,
             content: format!("Running... (up to {}s)", timeout_secs),
         });
 
-        // Spawn with a wall-clock timeout so a stuck `ask` (Anthropic
-        // overloaded, network blip) doesn't hang the TUI.
+        // Run on a worker with a wall-clock timeout and report back via
+        // `passthrough_pending`, drained in `poll_passthrough`. This used
+        // to `thread::spawn(...).join()` ON THE UI THREAD, freezing the
+        // ENTIRE TUI (no render, no input, no quit) for up to
+        // `timeout_secs` — as long as 600s for `ask`. Now it is fully
+        // async like every other op in this file.
         let bin = self.kannaka_bin.clone();
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let result = std::thread::spawn(move || {
-            let mut child = match Command::new(&bin)
-                .args(&owned)
-                .env("KANNAKA_QUIET", "1")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => return Err(format!("spawn: {}", e)),
+        let (tx, rx) = mpsc::channel::<CmdResult>();
+        self.passthrough_pending = Some(rx);
+        std::thread::spawn(move || {
+            let arg_refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+            let result = run_capture(&bin, &arg_refs, Duration::from_secs(timeout_secs));
+            let cmd_result = match result {
+                Ok(out) if out.status.success() => {
+                    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Result,
+                            content: if body.is_empty() {
+                                "(no output)".into()
+                            } else {
+                                body
+                            },
+                        }],
+                        // Several passthroughs (hear/see/voice) mutate the
+                        // medium; refresh observe on success as the old
+                        // sync path did.
+                        refresh_observe: true,
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    CmdResult {
+                        messages: vec![Message {
+                            role: Role::Error,
+                            content: format!("Error: {}", stderr.trim()),
+                        }],
+                        refresh_observe: false,
+                    }
+                }
+                Err(msg) => CmdResult {
+                    messages: vec![Message {
+                        role: Role::Error,
+                        content: msg,
+                    }],
+                    refresh_observe: false,
+                },
             };
-            let start = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_status)) => {
-                        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-                        return Ok(out);
+            let _ = tx.send(cmd_result);
+        });
+    }
+
+    /// Drain a completed passthrough command. Non-blocking; called every
+    /// event-loop tick. Pops the trailing "Running…" placeholder if it is
+    /// still the last line. The check matches the placeholder's CONTENT,
+    /// not just its System role — a concurrent `recall` can push its own
+    /// trailing System header (e.g. "0 results"), and a role-only check
+    /// would wrongly delete that instead of our placeholder.
+    fn poll_passthrough(&mut self) {
+        if let Some(rx) = &self.passthrough_pending {
+            match rx.try_recv() {
+                Ok(res) => {
+                    let pop_running = self
+                        .messages
+                        .last()
+                        .map(|m| {
+                            matches!(m.role, Role::System) && m.content.starts_with("Running...")
+                        })
+                        .unwrap_or(false);
+                    if pop_running {
+                        self.messages.pop();
                     }
-                    Ok(None) => {
-                        if start.elapsed() > Duration::from_secs(timeout_secs) {
-                            let _ = child.kill();
-                            return Err(format!("timeout after {}s", timeout_secs));
-                        }
-                        std::thread::sleep(Duration::from_millis(150));
+                    let refresh = res.refresh_observe;
+                    for m in res.messages {
+                        self.push_message(m);
                     }
-                    Err(e) => return Err(format!("wait: {}", e)),
+                    self.passthrough_pending = None;
+                    if refresh {
+                        self.load_observe();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.passthrough_pending = None;
                 }
             }
-        })
-        .join();
-
-        // Pop the "Running..." line so the result replaces it cleanly.
-        if matches!(self.messages.last().map(|m| &m.role), Some(Role::System)) {
-            self.messages.pop();
         }
+    }
 
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let body = stdout.trim();
-                self.push_message(Message {
-                    role: Role::Result,
-                    content: if body.is_empty() {
-                        "(no output)".into()
-                    } else {
-                        body.into()
-                    },
-                });
-                self.load_observe();
+    /// Kick off a one-shot Cosmos poll: `kannaka constellation` (health of
+    /// every constellation app) + `kannaka radio` (now playing), both on a
+    /// worker with timeouts. Partial success is fine — if radio is down we
+    /// still show the app grid, and vice versa. Drained by `poll_cosmos`.
+    fn load_cosmos(&mut self) {
+        if self.cosmos_pending.is_some() {
+            return;
+        }
+        self.cosmos_last_load = Instant::now();
+        let bin = self.kannaka_bin.clone();
+        let (tx, rx) = mpsc::channel::<Result<(Vec<CosmosApp>, Vec<String>), String>>();
+        self.cosmos_pending = Some(rx);
+        std::thread::spawn(move || {
+            // constellation pings ~10 endpoints over HTTP — give it 30s.
+            let apps = match run_capture(&bin, &["constellation"], Duration::from_secs(30)) {
+                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(parse_constellation_line)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            // radio: a single now-playing query; 15s is plenty.
+            let radio = match run_capture(&bin, &["radio"], Duration::from_secs(15)) {
+                Ok(out) if out.status.success() => {
+                    clean_radio_lines(&String::from_utf8_lossy(&out.stdout))
+                }
+                _ => Vec::new(),
+            };
+            let result = if apps.is_empty() && radio.is_empty() {
+                Err(
+                    "could not reach the constellation (constellation/radio returned nothing)"
+                        .to_string(),
+                )
+            } else {
+                Ok((apps, radio))
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Drain a completed Cosmos poll into render state. Non-blocking.
+    fn poll_cosmos(&mut self) {
+        if let Some(rx) = &self.cosmos_pending {
+            match rx.try_recv() {
+                Ok(Ok((apps, radio))) => {
+                    self.cosmos_apps = apps;
+                    self.cosmos_radio = radio;
+                    self.cosmos_error = None;
+                    self.cosmos_pending = None;
+                }
+                Ok(Err(e)) => {
+                    self.cosmos_error = Some(e);
+                    self.cosmos_pending = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.cosmos_pending = None;
+                }
             }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.push_message(Message {
-                    role: Role::Error,
-                    content: format!("Error: {}", stderr.trim()),
-                });
-            }
-            Ok(Err(msg)) => self.push_message(Message {
-                role: Role::Error,
-                content: msg,
-            }),
-            Err(_) => self.push_message(Message {
-                role: Role::Error,
-                content: "thread panicked".into(),
-            }),
         }
     }
 
@@ -1265,6 +1530,50 @@ impl App {
             // and we don't want them via the TUI (they'd hang the input).
             // Cap at 60s so a network hang doesn't lock the UI.
             self.execute_passthrough(cmd_input, &parts, 60);
+        } else if let Some(q) = cmd_input.strip_prefix("relate ") {
+            let q = q.trim().trim_matches('"');
+            self.execute_passthrough(&format!("relate \"{}\"", q), &["relate", q], 60);
+        } else if let Some(q) = cmd_input.strip_prefix("neighbors ") {
+            let q = q.trim().trim_matches('"');
+            self.execute_passthrough(&format!("neighbors \"{}\"", q), &["neighbors", q], 60);
+        } else if cmd_input == "clusters" || cmd_input.starts_with("clusters ") {
+            let parts: Vec<&str> = cmd_input.split_whitespace().collect();
+            self.execute_passthrough(cmd_input, &parts, 60);
+        } else if cmd_input == "topology" {
+            self.execute_passthrough("topology", &["topology"], 60);
+        } else if cmd_input == "market" || cmd_input.starts_with("market ") {
+            let parts: Vec<&str> = cmd_input.split_whitespace().collect();
+            self.execute_passthrough(cmd_input, &parts, 30);
+        } else if let Some(rest) = cmd_input.strip_prefix("see ") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.push_message(Message {
+                    role: Role::Error,
+                    content: "Usage: see <file-or-url>".into(),
+                });
+            } else {
+                let parts: Vec<&str> = std::iter::once("see")
+                    .chain(rest.split_whitespace())
+                    .collect();
+                // Visual absorb — decode + wavefront embed can take a while.
+                self.execute_passthrough(&format!("see {}", rest), &parts, 300);
+            }
+        } else if cmd_input == "constellation"
+            || cmd_input == "cosmos"
+            || cmd_input == "apps"
+            || cmd_input == "radio"
+            || cmd_input.starts_with("radio ")
+        {
+            // These live on the Cosmos tab — jump there and refresh rather
+            // than dumping raw status text into the message log.
+            if let Some(idx) = self.tabs.iter().position(|t| *t == "Cosmos") {
+                self.active_tab = idx;
+            }
+            self.load_cosmos();
+            self.push_message(Message {
+                role: Role::System,
+                content: "Opening Cosmos — constellation + radio status.".into(),
+            });
         } else if cmd_input == "help" || cmd_input == "?" {
             self.show_help = true;
         } else if cmd_input == "quit" || cmd_input == "exit" || cmd_input == "q" {
@@ -1710,6 +2019,12 @@ impl App {
                 // NATS stream (Dreams listens for KANNAKA.dreams events).
                 self.start_bus();
             }
+            6 => {
+                // Cosmos — refresh constellation/radio health, throttled.
+                if self.cosmos_last_load.elapsed() > COSMOS_POLL_INTERVAL {
+                    self.load_cosmos();
+                }
+            }
             _ => {}
         }
     }
@@ -1734,6 +2049,31 @@ impl App {
                 (KeyModifiers::NONE, KeyCode::Char('l'))
                 | (KeyModifiers::NONE, KeyCode::Char('L')) => {
                     self.start_dream("lite");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Bus tab: 'r' reconnects a failed stream (empty input only) so a
+        // transient NATS blip doesn't require restarting the TUI.
+        if self.active_tab == 2 && self.input.is_empty() && self.bus_status == BusStatus::Failed {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Char('r'))
+                | (KeyModifiers::NONE, KeyCode::Char('R')) => {
+                    self.restart_bus();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Cosmos tab: 'r' forces a constellation/radio refresh (empty input).
+        if self.active_tab == 6 && self.input.is_empty() {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Char('r'))
+                | (KeyModifiers::NONE, KeyCode::Char('R')) => {
+                    self.load_cosmos();
                     return;
                 }
                 _ => {}
@@ -1880,6 +2220,7 @@ fn ui(f: &mut Frame, app: &App) {
         3 => render_constellation_tab(f, app, outer[2]),
         4 => render_dreams_tab(f, app, outer[2]),
         5 => render_chat_tab(f, app, outer[2]),
+        6 => render_cosmos_tab(f, app, outer[2]),
         _ => {}
     }
 
@@ -2877,6 +3218,139 @@ fn render_constellation_tab(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, chunks[1]);
 }
 
+/// Cosmos tab — constellation-wide health. Top strip is `kannaka radio`
+/// now-playing; the body is the `kannaka constellation` app grid (✓ up /
+/// ✗ down); the hint bar shows poll state and the `r`-to-refresh key.
+fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // radio now-playing
+            Constraint::Min(6),    // app health grid
+            Constraint::Length(3), // hint bar
+        ])
+        .split(area);
+
+    // ----- Radio now-playing -----
+    let radio_pink = Color::Rgb(255, 100, 200);
+    let mut radio_lines: Vec<Line> = Vec::new();
+    if app.cosmos_radio.is_empty() {
+        radio_lines.push(Line::from(Span::styled(
+            "  radio offline or not yet polled",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for (i, l) in app.cosmos_radio.iter().enumerate() {
+            let style = if i == 0 {
+                Style::default().fg(radio_pink).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            radio_lines.push(Line::from(Span::styled(format!("  {}", l), style)));
+        }
+    }
+    let radio = Paragraph::new(radio_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(radio_pink))
+                .style(Style::default().bg(BG))
+                .title(Span::styled(
+                    " Kannaka Radio ",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(radio, chunks[0]);
+
+    // ----- App health grid -----
+    let mut app_lines: Vec<Line> = Vec::new();
+    if let Some(err) = &app.cosmos_error {
+        app_lines.push(Line::from(Span::styled(
+            format!("  {}", err),
+            Style::default().fg(ERROR),
+        )));
+    } else if app.cosmos_apps.is_empty() {
+        app_lines.push(Line::from(Span::styled(
+            if app.cosmos_pending.is_some() {
+                "  polling kannaka constellation…"
+            } else {
+                "  no constellation data — press 'r' to refresh"
+            },
+            Style::default().fg(DIM),
+        )));
+    } else {
+        let up = app.cosmos_apps.iter().filter(|a| a.up).count();
+        let total = app.cosmos_apps.len();
+        app_lines.push(Line::from(Span::styled(
+            format!("  {}/{} apps up", up, total),
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        )));
+        app_lines.push(Line::from(""));
+        for a in &app.cosmos_apps {
+            let (mark, mark_color) = if a.up {
+                ("\u{2713}", SUCCESS) // ✓
+            } else {
+                ("\u{2717}", ERROR) // ✗
+            };
+            let name_color = if a.up { TEXT } else { DIM };
+            app_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", mark),
+                    Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<24}", truncate(&a.name, 24)),
+                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {}", a.url), Style::default().fg(DIM)),
+            ]));
+        }
+    }
+    let apps_widget = Paragraph::new(app_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(BG))
+                .title(Span::styled(
+                    " Constellation · all apps ",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(apps_widget, chunks[1]);
+
+    // ----- Hint bar -----
+    let status = if app.cosmos_pending.is_some() {
+        Span::styled(" polling… ", Style::default().fg(WARNING))
+    } else {
+        Span::styled(" idle ", Style::default().fg(DIM))
+    };
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " r ",
+            Style::default()
+                .fg(BG)
+                .bg(INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" refresh   ", Style::default().fg(DIM)),
+        Span::styled("\u{2713}", Style::default().fg(SUCCESS)),
+        Span::styled(" up   ", Style::default().fg(DIM)),
+        Span::styled("\u{2717}", Style::default().fg(ERROR)),
+        Span::styled(" down  ", Style::default().fg(DIM)),
+        status,
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DIM))
+            .style(Style::default().bg(BG)),
+    );
+    f.render_widget(hints, chunks[2]);
+}
+
 fn bus_subject_color(subject: &str) -> Color {
     if subject.starts_with("QUEEN.phase.") {
         return DIM;
@@ -2922,6 +3396,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         3 => "[C]",
         4 => "[D]",
         5 => "[Ch]",
+        6 => "[Co]",
         _ => "[?]",
     };
 
@@ -2955,10 +3430,10 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    // Center the help box. Sized for the post-v0.5.8 tab + hotkey set —
-    // ~46 lines fit comfortably with room to grow.
-    let width = 78u16.min(area.width.saturating_sub(4));
-    let height = 46u16.min(area.height.saturating_sub(4));
+    // Center the help box. Sized for the full tab + command set; the
+    // Paragraph clips anything past the box on short terminals.
+    let width = 80u16.min(area.width.saturating_sub(4));
+    let height = 54u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -2970,7 +3445,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
 
     let help_text = vec![
         Line::from(Span::styled(
-            " Kannaka TUI · v0.5.8",
+            concat!(" Kannaka TUI · v", env!("CARGO_PKG_VERSION")),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -3001,6 +3476,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("   Chat          ", text),
             Span::styled("Persistent chat with HRM-loaded agent (default tab)", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   Cosmos        ", text),
+            Span::styled("Constellation-wide app health + radio now-playing", dim),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Navigation", hdr)),
@@ -3046,6 +3525,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("   l", kbd),
             Span::styled("   Lite dream — quick pass", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   r", kbd),
+            Span::styled("   Bus: reconnect failed stream · Cosmos: refresh", dim),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Chat tab plugin slash commands", hdr)),
@@ -3115,6 +3598,26 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled("<file-or-url>     ", text),
             Span::styled("Absorb audio (mp3/wav/flac/stream)", dim),
         ]),
+        Line::from(vec![
+            Span::styled("   see ", text),
+            Span::styled("<file-or-url>      ", text),
+            Span::styled("Absorb visual input as a wavefront", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   relate ", text),
+            Span::styled("/ ", dim),
+            Span::styled("neighbors ", text),
+            Span::styled("\"query\"   ", text),
+            Span::styled("Graph recall", dim),
+        ]),
+        Line::from(Span::styled(
+            "   also: clusters · topology · assess · stats · cmf · invariant · voice · swarm · boost · search · market",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "   cosmos · constellation · radio → open the Cosmos tab",
+            dim,
+        )),
         Line::from(Span::styled(
             "   anything else → routed to chat (agent picks tools)",
             dim,
@@ -3233,12 +3736,18 @@ fn main() -> io::Result<()> {
         // Drain a completed remember/recall/forget worker (no-op when idle).
         app.poll_cmd();
 
+        // Drain a completed passthrough command (ask/hear/search/…).
+        app.poll_passthrough();
+
         // Drain the live NATS bus stream (no-op until user opens Bus tab).
         app.poll_bus();
 
         // Drain streaming stdout of any active /code or /topus plugin
         // invocation (no-op when no plugin is running).
         app.poll_plugin();
+
+        // Drain a completed Cosmos poll (no-op until the user opens Cosmos).
+        app.poll_cosmos();
 
         // Auto-refresh status every 5s when on the Status tab
         if app.active_tab == 1 && app.last_status_poll.elapsed() > Duration::from_secs(5) {
@@ -3266,4 +3775,100 @@ fn main() -> io::Result<()> {
     reap_handle(&app.chat_child_proc);
     reap_handle(&app.plugin_child_proc);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure parsing/util functions (the threaded subprocess plumbing is
+// exercised by hand, but the parsers it feeds are unit-tested here).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_up_app_with_padded_url() {
+        let app =
+            parse_constellation_line("  \u{2713} Kannaka Radio    https://radio.ninja-portal.com")
+                .unwrap();
+        assert_eq!(app.name, "Kannaka Radio");
+        assert!(app.up);
+        assert_eq!(app.url, "https://radio.ninja-portal.com");
+    }
+
+    #[test]
+    fn parse_down_app() {
+        let app = parse_constellation_line("  \u{2717} Kannaktopus      http://170.9.238.136:8787")
+            .unwrap();
+        assert_eq!(app.name, "Kannaktopus");
+        assert!(!app.up);
+        assert_eq!(app.url, "http://170.9.238.136:8787");
+    }
+
+    #[test]
+    fn parse_single_space_before_scheme() {
+        // Name has internal spaces and only ONE space before the scheme;
+        // URL detection by `://` must still split it correctly.
+        let app = parse_constellation_line(
+            "  \u{2713} Kannaka Memory (HRM) systemd://kannaka-memory.service",
+        )
+        .unwrap();
+        assert_eq!(app.name, "Kannaka Memory (HRM)");
+        assert_eq!(app.url, "systemd://kannaka-memory.service");
+        assert!(app.up);
+    }
+
+    #[test]
+    fn header_divider_blank_skipped() {
+        assert!(parse_constellation_line("  \u{1F310} Kannaka Constellation Status").is_none());
+        assert!(parse_constellation_line("  \u{2500}\u{2500}\u{2500}\u{2500}").is_none());
+        assert!(parse_constellation_line("").is_none());
+        assert!(parse_constellation_line("   ").is_none());
+    }
+
+    #[test]
+    fn parse_app_without_url() {
+        let app = parse_constellation_line("\u{2717} Some Service").unwrap();
+        assert_eq!(app.name, "Some Service");
+        assert_eq!(app.url, "");
+        assert!(!app.up);
+    }
+
+    #[test]
+    fn parse_multibyte_whitespace_before_url_does_not_panic() {
+        // NBSP (U+00A0, 2 bytes) immediately before the scheme used to land
+        // `url_start` inside the code point and panic the byte slice.
+        let app = parse_constellation_line("\u{2713} App Name\u{00A0}https://app.example").unwrap();
+        assert!(app.up);
+        assert_eq!(app.url, "https://app.example");
+        assert_eq!(app.name, "App Name");
+        // Ideographic space (U+3000, 3 bytes) — same boundary hazard.
+        let app2 = parse_constellation_line("\u{2717} X\u{3000}wss://y.example/socket").unwrap();
+        assert_eq!(app2.url, "wss://y.example/socket");
+        assert_eq!(app2.name, "X");
+    }
+
+    #[test]
+    fn parse_multibyte_name() {
+        let app = parse_constellation_line("\u{2713} Café Server   https://café.example").unwrap();
+        assert!(app.up);
+        assert_eq!(app.name, "Café Server");
+        assert_eq!(app.url, "https://café.example");
+    }
+
+    #[test]
+    fn radio_lines_trim_and_drop_blanks() {
+        let lines = clean_radio_lines("  Now Playing: X  \n\n  station | time \n");
+        assert_eq!(lines, vec!["Now Playing: X", "station | time"]);
+    }
+
+    #[test]
+    fn byte_offset_handles_multibyte() {
+        assert_eq!(byte_offset("héllo", 0), 0);
+        // 'h'=0, 'é'=bytes 1..3, 'l'=byte 3 — char index 2 → byte 3.
+        assert_eq!(byte_offset("héllo", 2), 3);
+        // Past the end clamps to the byte length (the tail).
+        assert_eq!(byte_offset("héllo", 99), "héllo".len());
+        assert_eq!(byte_offset("", 0), 0);
+    }
 }

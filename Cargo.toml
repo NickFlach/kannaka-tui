@@ -1,8 +1,8 @@
 [package]
 name = "kannaka-tui"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Terminal dashboard for the Kannaka constellation — Memory, Status, Bus, Constellation, Dreams, Chat. Pure frontend over the `kannaka` CLI."
+description = "Terminal dashboard for the Kannaka constellation — Memory, Status, Bus, Constellation, Dreams, Chat, Cosmos. Pure frontend over the `kannaka` CLI."
 license = "MIT"
 repository = "https://github.com/NickFlach/kannaka-tui"
 readme = "README.md"
