@@ -2019,11 +2019,9 @@ impl App {
                 // NATS stream (Dreams listens for KANNAKA.dreams events).
                 self.start_bus();
             }
-            6 => {
-                // Cosmos — refresh constellation/radio health, throttled.
-                if self.cosmos_last_load.elapsed() > COSMOS_POLL_INTERVAL {
-                    self.load_cosmos();
-                }
+            // Cosmos — refresh constellation/radio health, throttled.
+            6 if self.cosmos_last_load.elapsed() > COSMOS_POLL_INTERVAL => {
+                self.load_cosmos();
             }
             _ => {}
         }
