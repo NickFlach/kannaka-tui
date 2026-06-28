@@ -65,6 +65,8 @@ The **Agent** tab turns kannaka-tui into a production-grade coding agent. Type a
 | `/plan` | read-only — the agent proposes, never mutates |
 | `/yolo` | run everything without asking |
 
+**Stuck or want to redirect?** Press `Esc` (or type `/stop`) while the agent is working to cancel the current turn, then type a new task. `/clear` resets the session.
+
 Other commands: `/model <id>` (switch model), `/clear` (fresh session), `/help`. Hard-blocked commands (`rm -rf /`, `curl … | sh`, fork bombs) are refused outright; destructive-but-reversible ones (`rm -rf`, `git reset --hard`, …) are flagged ⚠ in the approval dialog.
 
 The agent backend is the new `kannaka agent --json` subcommand (added to [kannaka-memory](https://github.com/NickFlach/kannaka-memory)); kannaka-tui is its harness front-end. Requires an LLM configured in `~/.kannaka/config.toml` (Anthropic); the harness falls back to a current model if the configured one is unavailable.
@@ -110,6 +112,7 @@ After `kannaka update` v0.5.15+, the kannaka binary will keep the TUI sibling up
 | `r` (Bus tab) | Reconnect a failed stream |
 | `r` (Cosmos tab) | Refresh constellation + radio status |
 | `a` / `s` / `d` (Agent tab) | Approve once / always / deny a tool call (when one is pending) |
+| `Esc` (Agent tab) | Cancel the current turn while the agent is working (`/stop` does the same) |
 
 ---
 

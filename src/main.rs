@@ -776,6 +776,20 @@ impl App {
         self.harness_status = HarnessStatus::Off;
     }
 
+    /// Interrupt an in-flight turn. The NDJSON protocol has no mid-LLM-call
+    /// cancel (the backend is blocked in the request), so the only reliable
+    /// stop is to kill the child; the next task starts a fresh agent (the
+    /// HRM reloads in ~3s). Bound to Esc and `/stop` on the Agent tab.
+    fn stop_harness(&mut self) {
+        let was_busy = self.harness_child.is_some();
+        self.restart_harness();
+        if was_busy {
+            self.push_harness(AgentLine::Notice(
+                "[stopped — turn cancelled. Type a new task to start again.]".into(),
+            ));
+        }
+    }
+
     /// Write one JSON frame (+newline) to the agent child's stdin.
     fn send_harness_frame(&mut self, frame: serde_json::Value) {
         if let Some(stdin) = &mut self.harness_stdin {
@@ -1891,6 +1905,7 @@ impl App {
                 Some("plan") => self.set_harness_mode("plan"),
                 Some("default") => self.set_harness_mode("default"),
                 Some("auto") | Some("auto-edit") => self.set_harness_mode("auto-edit"),
+                Some("stop") | Some("cancel") => self.stop_harness(),
                 Some("clear") => {
                     self.restart_harness();
                     self.harness_lines.clear();
@@ -2628,6 +2643,24 @@ impl App {
                     return;
                 }
                 _ => {}
+            }
+        }
+
+        // Agent tab: Esc interrupts an in-flight turn (when the agent is busy
+        // and no approval is pending). Fires before the quit block so Esc
+        // cancels the stuck/long-running agent instead of quitting the TUI —
+        // the one escape hatch when a turn is spinning.
+        if self.active_tab == 7
+            && self.input.is_empty()
+            && self.harness_pending.is_none()
+            && matches!(
+                self.harness_status,
+                HarnessStatus::Thinking | HarnessStatus::Starting
+            )
+        {
+            if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
+                self.stop_harness();
+                return;
             }
         }
 
@@ -4089,10 +4122,20 @@ fn render_harness_tab(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(INFO),
         ),
         Span::styled("\u{2502} ", Style::default().fg(DIM)),
-        Span::styled(
-            "Enter run \u{2502} /mode /yolo /plan /clear /model /help",
-            Style::default().fg(DIM),
-        ),
+        if matches!(
+            app.harness_status,
+            HarnessStatus::Thinking | HarnessStatus::Starting
+        ) {
+            Span::styled(
+                "Esc or /stop to cancel \u{2502} Ctrl+C quit",
+                Style::default().fg(WARNING).add_modifier(bold),
+            )
+        } else {
+            Span::styled(
+                "Enter run \u{2502} /stop /mode /yolo /plan /clear /model /help",
+                Style::default().fg(DIM),
+            )
+        },
     ]))
     .block(
         Block::default()
@@ -4313,6 +4356,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled(" / ", dim),
             Span::styled("d", kbd),
             Span::styled("          Approve once / always / deny (Esc=deny)", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   Esc", kbd),
+            Span::styled(" / ", dim),
+            Span::styled("/stop", kbd),
+            Span::styled("        Cancel a running/stuck turn", dim),
         ]),
         Line::from(vec![
             Span::styled("   /yolo /plan /default /auto", kbd),
