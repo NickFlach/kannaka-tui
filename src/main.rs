@@ -208,6 +208,150 @@ type ObserveRx = mpsc::Receiver<Result<(u64, Vec<MemoryEntry>), String>>;
 type CosmosRx = mpsc::Receiver<Result<(Vec<CosmosApp>, Vec<String>), String>>;
 
 // ---------------------------------------------------------------------------
+// Agent harness — the coding-agent surface. The TUI drives a long-running
+// `kannaka agent --json` child, renders its agentic transcript, and gates
+// filesystem/shell mutations behind a human approval dialog.
+// ---------------------------------------------------------------------------
+
+/// One event parsed from the `kannaka agent --json` NDJSON stream.
+#[derive(Clone)]
+enum AgentEvent {
+    Ready {
+        model: String,
+        mode: String,
+        cwd: String,
+    },
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        summary: String,
+        read_only: bool,
+        danger: bool,
+    },
+    ApprovalRequired {
+        id: String,
+        name: String,
+        summary: String,
+        danger: bool,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
+    Usage {
+        input: u64,
+        output: u64,
+    },
+    Iteration(usize),
+    Done(String),
+    Error(String),
+    Mode(String),
+    /// The child's stdout closed — it exited or the pipe broke.
+    Closed(String),
+}
+
+/// One rendered row of the harness transcript.
+#[derive(Clone)]
+enum AgentLine {
+    User(String),
+    Assistant(String),
+    /// A tool call. `result` is filled in when the matching `tool_result`
+    /// arrives (matched by `id`); `awaiting` flips false at that point.
+    Tool {
+        id: String,
+        name: String,
+        summary: String,
+        danger: bool,
+        result: Option<String>,
+        is_error: bool,
+        awaiting: bool,
+    },
+    Notice(String),
+}
+
+/// An in-flight approval request the human must resolve (a/s/d).
+#[derive(Clone)]
+struct PendingApproval {
+    id: String,
+    name: String,
+    summary: String,
+    danger: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum HarnessStatus {
+    Off,
+    Starting,
+    Ready,
+    Thinking,
+    AwaitingApproval,
+    Closed,
+}
+
+/// Parse one NDJSON line from `kannaka agent --json` into an `AgentEvent`.
+/// Returns `None` for unknown/malformed frames.
+fn parse_agent_event(v: &serde_json::Value) -> Option<AgentEvent> {
+    let kind = v.get("kind")?.as_str()?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let b = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    Some(match kind {
+        "ready" => AgentEvent::Ready {
+            model: s("model"),
+            mode: s("mode"),
+            cwd: s("cwd"),
+        },
+        "text" => AgentEvent::Text(s("text")),
+        "tool_use" => AgentEvent::ToolUse {
+            id: s("id"),
+            name: s("name"),
+            summary: tool_input_summary(
+                &s("name"),
+                v.get("input").unwrap_or(&serde_json::Value::Null),
+            ),
+            read_only: b("read_only"),
+            danger: b("danger"),
+        },
+        "approval_required" => AgentEvent::ApprovalRequired {
+            id: s("id"),
+            name: s("name"),
+            summary: s("summary"),
+            danger: b("danger"),
+        },
+        "tool_result" => AgentEvent::ToolResult {
+            id: s("id"),
+            content: s("content"),
+            is_error: b("is_error"),
+        },
+        "usage" => AgentEvent::Usage {
+            input: u("input"),
+            output: u("output"),
+        },
+        "iteration" => AgentEvent::Iteration(u("n") as usize),
+        "done" => AgentEvent::Done(s("reason")),
+        "error" => AgentEvent::Error(s("text")),
+        "mode" => AgentEvent::Mode(s("mode")),
+        _ => return None,
+    })
+}
+
+/// One-line human summary of a tool call's input, for the transcript.
+fn tool_input_summary(name: &str, input: &serde_json::Value) -> String {
+    let get = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "bash" => get("command").to_string(),
+        "read_file" | "write_file" | "edit_file" => get("file_path").to_string(),
+        "glob" | "grep" => get("pattern").to_string(),
+        "list_dir" => get("path").to_string(),
+        "recall" => get("query").to_string(),
+        "remember" => truncate(get("content"), 60),
+        _ => truncate(&serde_json::to_string(input).unwrap_or_default(), 80),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -293,6 +437,23 @@ struct App {
     cosmos_pending: Option<CosmosRx>,
     cosmos_error: Option<String>,
     cosmos_last_load: Instant,
+    // ---- Agent harness tab — long-running `kannaka agent --json` child.
+    // The child is owned here (reaped on quit); stdin is held to send
+    // user/approval/mode frames; a reader thread parses stdout NDJSON into
+    // AgentEvents drained by `poll_harness`.
+    harness_child: Option<std::process::Child>,
+    harness_stdin: Option<std::process::ChildStdin>,
+    harness_rx: Option<mpsc::Receiver<AgentEvent>>,
+    harness_lines: Vec<AgentLine>,
+    harness_status: HarnessStatus,
+    harness_mode: String,
+    harness_model: String,
+    harness_cwd: String,
+    harness_pending: Option<PendingApproval>,
+    harness_usage_in: u64,
+    harness_usage_out: u64,
+    harness_iter: usize,
+    harness_tick: usize,
 }
 
 /// Shared slot holding a spawned `Child` so the main thread can reap a
@@ -312,6 +473,9 @@ fn reap_handle(h: &ChildHandle) {
 
 const BUS_BACKLOG_CAP: usize = 500;
 const DREAM_HISTORY_CAP: usize = 30;
+/// Cap on the Agent-harness transcript so a long session can't grow it
+/// without bound — same discipline as every other buffer here.
+const HARNESS_LINES_CAP: usize = 2000;
 /// Cap on the Memory-tab message log. Like `bus_lines`/`dream_history`,
 /// `messages` otherwise grows unbounded across a long session; trim the
 /// oldest entries past this many.
@@ -443,7 +607,9 @@ impl App {
             // reachable via Tab/Shift+Tab but the user lands in chat.
             // Bus sits between Status and Constellation as the live
             // constellation pulse view.
-            active_tab: 5,
+            // Land on the Agent harness — the primary surface. Every other
+            // tab is still reachable via Tab/Shift+Tab.
+            active_tab: 7,
             tabs: vec![
                 "Memory",
                 "Status",
@@ -452,6 +618,7 @@ impl App {
                 "Dreams",
                 "Chat",
                 "Cosmos",
+                "Agent",
             ],
             input: String::new(),
             cursor_pos: 0,
@@ -504,6 +671,309 @@ impl App {
             cosmos_error: None,
             // Force an initial load the first time the Cosmos tab opens.
             cosmos_last_load: Instant::now() - COSMOS_POLL_INTERVAL,
+            harness_child: None,
+            harness_stdin: None,
+            harness_rx: None,
+            harness_lines: vec![AgentLine::Notice(
+                "Kannaka Agent — a coding agent over the constellation. Type a task and \
+                 press Enter to start. Filesystem/shell changes ask for your approval."
+                    .into(),
+            )],
+            harness_status: HarnessStatus::Off,
+            harness_mode: "default".into(),
+            harness_model: String::new(),
+            harness_cwd: String::new(),
+            harness_pending: None,
+            harness_usage_in: 0,
+            harness_usage_out: 0,
+            harness_iter: 0,
+            harness_tick: 0,
+        }
+    }
+
+    /// Spawn the long-running `kannaka agent --json` child and a reader
+    /// thread that parses its NDJSON stdout into `AgentEvent`s. Lazy — only
+    /// started when the user first sends a task (or after a restart).
+    fn start_harness(&mut self) {
+        if self.harness_child.is_some() {
+            return;
+        }
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".into());
+        self.harness_cwd = cwd.clone();
+        self.harness_status = HarnessStatus::Starting;
+        let mode = self.harness_mode.clone();
+        let model = self.harness_model.clone();
+
+        let (tx, rx) = mpsc::channel::<AgentEvent>();
+        self.harness_rx = Some(rx);
+
+        let mut cmd = Command::new(&self.kannaka_bin);
+        cmd.args(["agent", "--json", "--cwd", &cwd, "--mode", &mode]);
+        if !model.is_empty() {
+            cmd.args(["--model", &model]);
+        }
+        cmd.env("KANNAKA_QUIET", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_harness(AgentLine::Notice(format!(
+                    "[could not start 'kannaka agent': {e} — is the kannaka binary on PATH?]"
+                )));
+                self.harness_status = HarnessStatus::Closed;
+                self.harness_rx = None;
+                return;
+            }
+        };
+        self.harness_stdin = child.stdin.take();
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                self.harness_status = HarnessStatus::Closed;
+                return;
+            }
+        };
+        self.harness_child = Some(child);
+
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Some(ev) = parse_agent_event(&v) {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(AgentEvent::Closed("agent stdout closed".into()));
+        });
+    }
+
+    /// Kill the running agent child (gracefully if possible) and reset
+    /// harness state. Used by `/clear` and `/model`.
+    fn restart_harness(&mut self) {
+        if let Some(mut child) = self.harness_child.take() {
+            if let Some(mut stdin) = self.harness_stdin.take() {
+                use std::io::Write;
+                let _ = writeln!(stdin, "{}", serde_json::json!({ "type": "exit" }));
+                let _ = stdin.flush();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.harness_stdin = None;
+        self.harness_rx = None;
+        self.harness_pending = None;
+        self.harness_status = HarnessStatus::Off;
+    }
+
+    /// Write one JSON frame (+newline) to the agent child's stdin.
+    fn send_harness_frame(&mut self, frame: serde_json::Value) {
+        if let Some(stdin) = &mut self.harness_stdin {
+            use std::io::Write;
+            let _ = writeln!(stdin, "{frame}");
+            let _ = stdin.flush();
+        }
+    }
+
+    /// Append to the transcript, trimming the oldest entries past the cap.
+    fn push_harness(&mut self, line: AgentLine) {
+        self.harness_lines.push(line);
+        if self.harness_lines.len() > HARNESS_LINES_CAP {
+            let overflow = self.harness_lines.len() - HARNESS_LINES_CAP;
+            self.harness_lines.drain(0..overflow);
+        }
+    }
+
+    /// Begin (or continue) a turn: ensure the child is up, echo the user
+    /// line, and send the user frame. The frame buffers in the pipe until
+    /// the backend finishes loading the HRM and starts reading stdin.
+    fn harness_user_turn(&mut self, text: String) {
+        if self.harness_child.is_none()
+            || matches!(
+                self.harness_status,
+                HarnessStatus::Closed | HarnessStatus::Off
+            )
+        {
+            self.start_harness();
+        }
+        self.push_harness(AgentLine::User(text.clone()));
+        self.harness_status = HarnessStatus::Thinking;
+        self.scroll_offset = 0;
+        self.send_harness_frame(serde_json::json!({ "type": "user", "text": text }));
+    }
+
+    /// Resolve the active approval request (allow / allow_always / deny).
+    fn resolve_approval(&mut self, decision: &str) {
+        if let Some(p) = self.harness_pending.take() {
+            self.send_harness_frame(serde_json::json!({
+                "type": "approval", "id": p.id, "decision": decision
+            }));
+            let verb = match decision {
+                "allow" => "allowed",
+                "allow_always" => "allowed (always)",
+                _ => "denied",
+            };
+            self.push_harness(AgentLine::Notice(format!(
+                "[{verb}: {} {}]",
+                p.name, p.summary
+            )));
+            self.harness_status = HarnessStatus::Thinking;
+        }
+    }
+
+    /// Set the permission mode, forwarding to the running child if any.
+    fn set_harness_mode(&mut self, mode: &str) {
+        self.harness_mode = mode.to_string();
+        if self.harness_child.is_some() {
+            self.send_harness_frame(serde_json::json!({ "type": "mode", "mode": mode }));
+        } else {
+            self.push_harness(AgentLine::Notice(format!(
+                "[mode set to {mode} — applies when the agent starts]"
+            )));
+        }
+    }
+
+    /// Drain agent events from the reader thread. Non-blocking; called each
+    /// tick. Events are collected first to avoid holding the `harness_rx`
+    /// borrow across the `&mut self` apply calls.
+    fn poll_harness(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.harness_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for ev in events {
+            self.apply_agent_event(ev);
+        }
+        if disconnected {
+            self.harness_rx = None;
+        }
+    }
+
+    fn apply_agent_event(&mut self, ev: AgentEvent) {
+        match ev {
+            AgentEvent::Ready { model, mode, cwd } => {
+                self.harness_model = model;
+                self.harness_mode = mode;
+                self.harness_cwd = cwd;
+                self.harness_status = HarnessStatus::Ready;
+                self.push_harness(AgentLine::Notice(format!(
+                    "agent ready · {} · {}",
+                    self.harness_model, self.harness_cwd
+                )));
+            }
+            AgentEvent::Text(t) => {
+                if !t.trim().is_empty() {
+                    self.push_harness(AgentLine::Assistant(t));
+                }
+                self.scroll_offset = 0;
+            }
+            AgentEvent::ToolUse {
+                id,
+                name,
+                summary,
+                read_only,
+                danger,
+            } => {
+                self.push_harness(AgentLine::Tool {
+                    id,
+                    name,
+                    summary,
+                    danger,
+                    result: None,
+                    is_error: false,
+                    awaiting: !read_only,
+                });
+                self.scroll_offset = 0;
+            }
+            AgentEvent::ApprovalRequired {
+                id,
+                name,
+                summary,
+                danger,
+            } => {
+                self.harness_pending = Some(PendingApproval {
+                    id,
+                    name,
+                    summary,
+                    danger,
+                });
+                self.harness_status = HarnessStatus::AwaitingApproval;
+            }
+            AgentEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            } => {
+                for line in self.harness_lines.iter_mut().rev() {
+                    if let AgentLine::Tool {
+                        id: lid,
+                        result,
+                        is_error: le,
+                        awaiting,
+                        ..
+                    } = line
+                    {
+                        if *lid == id {
+                            *result = Some(content);
+                            *le = is_error;
+                            *awaiting = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            AgentEvent::Usage { input, output } => {
+                self.harness_usage_in += input;
+                self.harness_usage_out += output;
+            }
+            AgentEvent::Iteration(n) => {
+                self.harness_iter = n;
+                if self.harness_pending.is_none() {
+                    self.harness_status = HarnessStatus::Thinking;
+                }
+            }
+            AgentEvent::Done(reason) => {
+                self.harness_status = HarnessStatus::Ready;
+                if reason != "end_turn" {
+                    self.push_harness(AgentLine::Notice(format!("[turn ended: {reason}]")));
+                }
+            }
+            AgentEvent::Error(t) => {
+                self.push_harness(AgentLine::Notice(format!("[error: {t}]")));
+            }
+            AgentEvent::Mode(m) => {
+                self.harness_mode = m.clone();
+                self.push_harness(AgentLine::Notice(format!("[mode → {m}]")));
+            }
+            AgentEvent::Closed(reason) => {
+                self.harness_status = HarnessStatus::Closed;
+                self.harness_pending = None;
+                self.harness_stdin = None;
+                self.harness_child = None;
+                self.push_harness(AgentLine::Notice(format!(
+                    "[agent closed: {reason} — type a task to restart]"
+                )));
+            }
         }
     }
 
@@ -1411,6 +1881,64 @@ impl App {
         self.history.push(input.clone());
         self.history_idx = None;
 
+        // Agent harness tab — drive the kannaka coding agent.
+        if self.tabs.get(self.active_tab).copied() == Some("Agent") {
+            let cmd = input.strip_prefix('/').map(|s| s.trim());
+            match cmd {
+                Some("help") | Some("?") => self.show_help = true,
+                Some("quit") | Some("exit") | Some("q") => self.should_quit = true,
+                Some("yolo") => self.set_harness_mode("yolo"),
+                Some("plan") => self.set_harness_mode("plan"),
+                Some("default") => self.set_harness_mode("default"),
+                Some("auto") | Some("auto-edit") => self.set_harness_mode("auto-edit"),
+                Some("clear") => {
+                    self.restart_harness();
+                    self.harness_lines.clear();
+                    self.harness_usage_in = 0;
+                    self.harness_usage_out = 0;
+                    self.harness_iter = 0;
+                    self.push_harness(AgentLine::Notice(
+                        "[cleared — type a task to start a fresh agent]".into(),
+                    ));
+                }
+                Some(rest) if rest.starts_with("mode ") => {
+                    let m = rest["mode ".len()..].trim().to_string();
+                    self.set_harness_mode(&m);
+                }
+                Some(rest) if rest.starts_with("model ") => {
+                    let m = rest["model ".len()..].trim().to_string();
+                    self.harness_model = m.clone();
+                    self.restart_harness();
+                    self.push_harness(AgentLine::Notice(format!(
+                        "[model set to {m} — type a task to start]"
+                    )));
+                }
+                Some(other) => self.push_harness(AgentLine::Notice(format!(
+                    "[unknown command /{other} — try /help]"
+                ))),
+                None => {
+                    if self.harness_pending.is_some() {
+                        self.push_harness(AgentLine::Notice(
+                            "[approval pending — press a (allow), s (allow always), or d (deny)]"
+                                .into(),
+                        ));
+                    } else if matches!(
+                        self.harness_status,
+                        HarnessStatus::Thinking | HarnessStatus::Starting
+                    ) {
+                        self.push_harness(AgentLine::Notice(
+                            "[agent is working — wait for it to finish]".into(),
+                        ));
+                    } else {
+                        self.harness_user_turn(input.clone());
+                    }
+                }
+            }
+            self.input.clear();
+            self.cursor_pos = 0;
+            return;
+        }
+
         // Chat tab — send to agent in a background thread.
         if self.tabs.get(self.active_tab).copied() == Some("Chat") {
             if self.chat_pending.is_some() {
@@ -2078,6 +2606,31 @@ impl App {
             }
         }
 
+        // Agent tab: when an approval is pending, a/s/d (or Esc=deny) resolve
+        // it directly. Fires before the quit block so Esc cancels the
+        // approval instead of quitting the TUI.
+        if self.active_tab == 7 && self.harness_pending.is_some() && self.input.is_empty() {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Char('a'))
+                | (KeyModifiers::NONE, KeyCode::Char('A')) => {
+                    self.resolve_approval("allow");
+                    return;
+                }
+                (KeyModifiers::NONE, KeyCode::Char('s'))
+                | (KeyModifiers::NONE, KeyCode::Char('S')) => {
+                    self.resolve_approval("allow_always");
+                    return;
+                }
+                (KeyModifiers::NONE, KeyCode::Char('d'))
+                | (KeyModifiers::NONE, KeyCode::Char('D'))
+                | (KeyModifiers::NONE, KeyCode::Esc) => {
+                    self.resolve_approval("deny");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Empty-input quit shortcuts: q and Esc. Only fire when the
         // command bar is empty so users can still type `quit` etc. as
         // a literal command. Always available regardless of active tab.
@@ -2219,6 +2772,7 @@ fn ui(f: &mut Frame, app: &App) {
         4 => render_dreams_tab(f, app, outer[2]),
         5 => render_chat_tab(f, app, outer[2]),
         6 => render_cosmos_tab(f, app, outer[2]),
+        7 => render_harness_tab(f, app, outer[2]),
         _ => {}
     }
 
@@ -3349,6 +3903,268 @@ fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(hints, chunks[2]);
 }
 
+/// Agent harness tab — the coding-agent surface. Renders the agentic
+/// transcript (user / assistant / tool calls + results / notices), a status
+/// strip (mode · model · state · token usage), and, when a mutation needs
+/// the human's sign-off, a centered approval modal.
+fn render_harness_tab(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .split(area);
+
+    // ----- Transcript -----
+    let bold = Modifier::BOLD;
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in &app.harness_lines {
+        match entry {
+            AgentLine::User(t) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "you \u{25B8} ",
+                        Style::default().fg(INFO).add_modifier(bold),
+                    ),
+                    Span::styled(t.clone(), Style::default().fg(TEXT)),
+                ]));
+            }
+            AgentLine::Assistant(t) => {
+                let mut first = true;
+                for seg in t.split('\n') {
+                    if first {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "kannaka ",
+                                Style::default().fg(ACCENT).add_modifier(bold),
+                            ),
+                            Span::styled(seg.to_string(), Style::default().fg(TEXT)),
+                        ]));
+                        first = false;
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("        {seg}"),
+                            Style::default().fg(TEXT),
+                        )));
+                    }
+                }
+            }
+            AgentLine::Tool {
+                name,
+                summary,
+                danger,
+                result,
+                is_error,
+                awaiting,
+                ..
+            } => {
+                let mark_color = if *is_error {
+                    ERROR
+                } else if *awaiting {
+                    WARNING
+                } else {
+                    SUCCESS
+                };
+                let mut spans = vec![
+                    Span::styled("  \u{2699} ", Style::default().fg(mark_color)),
+                    Span::styled(name.clone(), Style::default().fg(INFO).add_modifier(bold)),
+                    Span::styled(
+                        format!(" {}", truncate(summary, 88)),
+                        Style::default().fg(DIM),
+                    ),
+                ];
+                if *danger {
+                    spans.push(Span::styled(" \u{26A0}", Style::default().fg(ERROR)));
+                }
+                if *awaiting {
+                    spans.push(Span::styled(
+                        "  (awaiting approval)",
+                        Style::default().fg(WARNING).add_modifier(bold),
+                    ));
+                }
+                lines.push(Line::from(spans));
+                if let Some(r) = result {
+                    let rc = if *is_error { ERROR } else { DIM };
+                    let segs: Vec<&str> = r.split('\n').collect();
+                    for seg in segs.iter().take(6) {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {}", truncate(seg, 104)),
+                            Style::default().fg(rc),
+                        )));
+                    }
+                    if segs.len() > 6 {
+                        lines.push(Line::from(Span::styled(
+                            format!("      \u{2026} (+{} more lines)", segs.len() - 6),
+                            Style::default().fg(DIM),
+                        )));
+                    }
+                }
+            }
+            AgentLine::Notice(t) => {
+                lines.push(Line::from(Span::styled(
+                    format!("\u{00B7} {t}"),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+    // Spinner while the agent is working.
+    if matches!(
+        app.harness_status,
+        HarnessStatus::Thinking | HarnessStatus::Starting
+    ) {
+        let frames = ['\u{2014}', '\\', '|', '/'];
+        let frame = frames[app.harness_tick % frames.len()];
+        let label = if app.harness_status == HarnessStatus::Starting {
+            "loading HRM\u{2026}"
+        } else {
+            "working\u{2026}"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("kannaka {frame} "), Style::default().fg(ACCENT)),
+            Span::styled(label, Style::default().fg(DIM)),
+        ]));
+    }
+
+    // Window to the last screenful, honoring scroll_offset (lines up from the
+    // bottom) — same offset-from-end pattern as the other transcript tabs.
+    let body_height = chunks[0].height.saturating_sub(2) as usize;
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .rev()
+        .skip(app.scroll_offset)
+        .take(body_height.max(1))
+        .rev()
+        .collect();
+
+    let title = format!(
+        " Agent · {} ",
+        match app.harness_status {
+            HarnessStatus::Off => "idle",
+            HarnessStatus::Starting => "starting",
+            HarnessStatus::Ready => "ready",
+            HarnessStatus::Thinking => "working",
+            HarnessStatus::AwaitingApproval => "needs approval",
+            HarnessStatus::Closed => "closed",
+        }
+    );
+    let para = Paragraph::new(visible)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(BG))
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(TEXT).add_modifier(bold),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, chunks[0]);
+
+    // ----- Status strip -----
+    let mode_color = match app.harness_mode.as_str() {
+        "yolo" => ERROR,
+        "plan" => INFO,
+        "auto-edit" => WARNING,
+        _ => SUCCESS,
+    };
+    let model = if app.harness_model.is_empty() {
+        "(config)".to_string()
+    } else {
+        app.harness_model.clone()
+    };
+    let status = Paragraph::new(Line::from(vec![
+        Span::styled(" mode ", Style::default().fg(DIM)),
+        Span::styled(
+            format!("{} ", app.harness_mode),
+            Style::default().fg(mode_color).add_modifier(bold),
+        ),
+        Span::styled("\u{2502} model ", Style::default().fg(DIM)),
+        Span::styled(format!("{model} "), Style::default().fg(TEXT)),
+        Span::styled("\u{2502} tokens ", Style::default().fg(DIM)),
+        Span::styled(
+            format!(
+                "\u{2191}{} \u{2193}{} ",
+                app.harness_usage_in, app.harness_usage_out
+            ),
+            Style::default().fg(INFO),
+        ),
+        Span::styled("\u{2502} ", Style::default().fg(DIM)),
+        Span::styled(
+            "Enter run \u{2502} /mode /yolo /plan /clear /model /help",
+            Style::default().fg(DIM),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DIM))
+            .style(Style::default().bg(BG)),
+    );
+    f.render_widget(status, chunks[1]);
+
+    // ----- Approval modal -----
+    if let Some(p) = &app.harness_pending {
+        render_approval_modal(f, area, p);
+    }
+}
+
+/// Centered modal asking the human to allow/deny a mutating tool call.
+fn render_approval_modal(f: &mut Frame, area: Rect, p: &PendingApproval) {
+    let bold = Modifier::BOLD;
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let height = 11u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal = Rect::new(x, y, width, height);
+
+    let border = if p.danger { ERROR } else { WARNING };
+    let mut text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  tool  ", Style::default().fg(DIM)),
+            Span::styled(p.name.clone(), Style::default().fg(INFO).add_modifier(bold)),
+        ]),
+        Line::from(vec![
+            Span::styled("  cmd   ", Style::default().fg(DIM)),
+            Span::styled(truncate(&p.summary, 60), Style::default().fg(TEXT)),
+        ]),
+    ];
+    if p.danger {
+        text.push(Line::from(Span::styled(
+            "  \u{26A0} destructive command — review carefully",
+            Style::default().fg(ERROR).add_modifier(bold),
+        )));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::styled(
+            "   a ",
+            Style::default().fg(BG).bg(SUCCESS).add_modifier(bold),
+        ),
+        Span::styled(" allow once   ", Style::default().fg(TEXT)),
+        Span::styled(" s ", Style::default().fg(BG).bg(INFO).add_modifier(bold)),
+        Span::styled(" allow always   ", Style::default().fg(TEXT)),
+        Span::styled(" d ", Style::default().fg(BG).bg(ERROR).add_modifier(bold)),
+        Span::styled(" deny (Esc) ", Style::default().fg(TEXT)),
+    ]));
+
+    let clear = Block::default().style(Style::default().bg(Color::Rgb(20, 18, 30)));
+    f.render_widget(clear, modal);
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border).add_modifier(bold))
+                .style(Style::default().bg(Color::Rgb(20, 18, 30)))
+                .title(Span::styled(
+                    " Approval required ",
+                    Style::default().fg(border).add_modifier(bold),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, modal);
+}
+
 fn bus_subject_color(subject: &str) -> Color {
     if subject.starts_with("QUEEN.phase.") {
         return DIM;
@@ -3395,6 +4211,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         4 => "[D]",
         5 => "[Ch]",
         6 => "[Co]",
+        7 => "[Ag]",
         _ => "[?]",
     };
 
@@ -3431,7 +4248,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     // Center the help box. Sized for the full tab + command set; the
     // Paragraph clips anything past the box on short terminals.
     let width = 80u16.min(area.width.saturating_sub(4));
-    let height = 54u16.min(area.height.saturating_sub(4));
+    let height = 62u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -3473,11 +4290,39 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("   Chat          ", text),
-            Span::styled("Persistent chat with HRM-loaded agent (default tab)", dim),
+            Span::styled("Persistent chat with the HRM-loaded agent", dim),
         ]),
         Line::from(vec![
             Span::styled("   Cosmos        ", text),
             Span::styled("Constellation-wide app health + radio now-playing", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   Agent         ", text),
+            Span::styled("Coding-agent harness with tools + approvals (default)", dim),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" Agent harness (coding agent)", hdr)),
+        Line::from(vec![
+            Span::styled("   <task>", kbd),
+            Span::styled("              Type a task + Enter to run the agent", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   a", kbd),
+            Span::styled(" / ", dim),
+            Span::styled("s", kbd),
+            Span::styled(" / ", dim),
+            Span::styled("d", kbd),
+            Span::styled("          Approve once / always / deny (Esc=deny)", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   /yolo /plan /default /auto", kbd),
+            Span::styled("  Permission mode", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   /model <id>", kbd),
+            Span::styled("        Switch model   ", dim),
+            Span::styled("/clear", kbd),
+            Span::styled(" Reset", dim),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Navigation", hdr)),
@@ -3747,6 +4592,16 @@ fn main() -> io::Result<()> {
         // Drain a completed Cosmos poll (no-op until the user opens Cosmos).
         app.poll_cosmos();
 
+        // Drain the agent harness child's NDJSON events; advance its spinner
+        // while a turn or approval is in flight.
+        app.poll_harness();
+        if matches!(
+            app.harness_status,
+            HarnessStatus::Thinking | HarnessStatus::Starting
+        ) {
+            app.harness_tick = app.harness_tick.wrapping_add(1);
+        }
+
         // Auto-refresh status every 5s when on the Status tab
         if app.active_tab == 1 && app.last_status_poll.elapsed() > Duration::from_secs(5) {
             app.load_status();
@@ -3767,6 +4622,12 @@ fn main() -> io::Result<()> {
     //   - plugin child (kannaka-code / kannaktopus) — owned by its worker
     // Dropping stdin alone doesn't terminate the chat REPL, so kill it.
     if let Some(mut child) = app.bus_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // Agent harness child (kannaka agent --json) — owned directly; kill it so
+    // no background coding-agent process outlives the TUI.
+    if let Some(mut child) = app.harness_child.take() {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -3868,5 +4729,83 @@ mod tests {
         // Past the end clamps to the byte length (the tail).
         assert_eq!(byte_offset("héllo", 99), "héllo".len());
         assert_eq!(byte_offset("", 0), 0);
+    }
+
+    #[test]
+    fn agent_event_parses_each_kind() {
+        let p = |s: &str| parse_agent_event(&serde_json::from_str(s).unwrap());
+        assert!(matches!(
+            p(r#"{"kind":"ready","model":"m","mode":"default","cwd":"/w"}"#),
+            Some(AgentEvent::Ready { .. })
+        ));
+        assert!(
+            matches!(p(r#"{"kind":"text","text":"hi"}"#), Some(AgentEvent::Text(t)) if t == "hi")
+        );
+        assert!(matches!(
+            p(
+                r#"{"kind":"tool_use","id":"t1","name":"bash","input":{"command":"ls"},"read_only":false,"danger":false}"#
+            ),
+            Some(AgentEvent::ToolUse {
+                read_only: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            p(
+                r#"{"kind":"approval_required","id":"t1","name":"write_file","summary":"a.txt","danger":false}"#
+            ),
+            Some(AgentEvent::ApprovalRequired { .. })
+        ));
+        assert!(matches!(
+            p(r#"{"kind":"tool_result","id":"t1","content":"ok","is_error":false}"#),
+            Some(AgentEvent::ToolResult {
+                is_error: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            p(r#"{"kind":"usage","input":10,"output":5}"#),
+            Some(AgentEvent::Usage {
+                input: 10,
+                output: 5
+            })
+        ));
+        assert!(matches!(
+            p(r#"{"kind":"iteration","n":3}"#),
+            Some(AgentEvent::Iteration(3))
+        ));
+        assert!(
+            matches!(p(r#"{"kind":"done","reason":"end_turn"}"#), Some(AgentEvent::Done(r)) if r == "end_turn")
+        );
+        assert!(matches!(
+            p(r#"{"kind":"error","text":"boom"}"#),
+            Some(AgentEvent::Error(_))
+        ));
+        assert!(
+            matches!(p(r#"{"kind":"mode","mode":"yolo"}"#), Some(AgentEvent::Mode(m)) if m == "yolo")
+        );
+        // Unknown / malformed frames yield None.
+        assert!(p(r#"{"kind":"who_knows"}"#).is_none());
+        assert!(p(r#"{"no_kind":1}"#).is_none());
+    }
+
+    #[test]
+    fn tool_summary_extracts_key_field() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(
+            tool_input_summary("bash", &j(r#"{"command":"cargo test"}"#)),
+            "cargo test"
+        );
+        assert_eq!(
+            tool_input_summary(
+                "write_file",
+                &j(r#"{"file_path":"src/x.rs","content":"..."}"#)
+            ),
+            "src/x.rs"
+        );
+        assert_eq!(
+            tool_input_summary("grep", &j(r#"{"pattern":"TODO"}"#)),
+            "TODO"
+        );
     }
 }
