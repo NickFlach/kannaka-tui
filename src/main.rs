@@ -6,7 +6,10 @@
 //! against kannaka-memory as a library.
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -365,6 +368,9 @@ struct App {
     status: Option<Status>,
     agent_name: String,
     should_quit: bool,
+    /// When the last paste burst landed. Used to absorb an Enter that arrives
+    /// right after a paste (a multi-line paste's line break, not a submit).
+    last_paste_at: Option<Instant>,
     scroll_offset: usize,
     last_status_poll: Instant,
     show_help: bool,
@@ -633,6 +639,7 @@ impl App {
             status: None,
             agent_name,
             should_quit: false,
+            last_paste_at: None,
             scroll_offset: 0,
             last_status_poll: Instant::now() - Duration::from_secs(60), // force initial poll
             show_help: false,
@@ -899,7 +906,9 @@ impl App {
                 if !t.trim().is_empty() {
                     self.push_harness(AgentLine::Assistant(t));
                 }
-                self.scroll_offset = 0;
+                // Don't yank to the bottom on every streamed line — when offset
+                // is 0 the view already auto-follows; when the user has scrolled
+                // up to read, leave their position alone.
             }
             AgentEvent::ToolUse {
                 id,
@@ -917,7 +926,7 @@ impl App {
                     is_error: false,
                     awaiting: !read_only,
                 });
-                self.scroll_offset = 0;
+                // Preserve the user's scroll position (see AgentEvent::Text).
             }
             AgentEvent::ApprovalRequired {
                 id,
@@ -2707,7 +2716,24 @@ impl App {
             // offset — translate to a byte boundary before mutating
             // `self.input` so multi-byte UTF-8 (emoji, accents) never
             // splits a code point and panics.
-            (_, KeyCode::Enter) => self.submit_input(),
+            (_, KeyCode::Enter) => {
+                // A newline arriving within a moment of a paste burst is a
+                // multi-line paste's line break (Windows delivers no Event::Paste;
+                // lines arrive as separate bursts), not a deliberate submit — absorb
+                // it as a space so the paste keeps accumulating. Typed input never
+                // sets last_paste_at, so a normal Enter still submits.
+                let pasting = self
+                    .last_paste_at
+                    .map_or(false, |t| t.elapsed() < Duration::from_millis(150));
+                if pasting {
+                    let at = byte_offset(&self.input, self.cursor_pos);
+                    self.input.insert(at, ' ');
+                    self.cursor_pos += 1;
+                    self.last_paste_at = Some(Instant::now());
+                } else {
+                    self.submit_input();
+                }
+            }
             (_, KeyCode::Char(c)) => {
                 let at = byte_offset(&self.input, self.cursor_pos);
                 self.input.insert(at, c);
@@ -2734,6 +2760,15 @@ impl App {
             (_, KeyCode::Home) => self.cursor_pos = 0,
             (_, KeyCode::End) => self.cursor_pos = self.input.chars().count(),
 
+            // When not typing, the arrows scroll the transcript a line at a time
+            // (PageUp/PageDown jump a screenful). With text in the input bar they
+            // recall input history instead.
+            (_, KeyCode::Up) if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
+            (_, KeyCode::Down) if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
             // Scroll history — no-op when history is empty
             (_, KeyCode::Up) if !self.history.is_empty() => {
                 let idx = match self.history_idx {
@@ -2769,6 +2804,33 @@ impl App {
 
             _ => {}
         }
+    }
+
+    /// Insert pasted text into the input buffer at the cursor. Newlines and tabs
+    /// flatten to spaces — the input is one logical line (Enter submits), so a
+    /// multi-line paste becomes a single message instead of N submissions. Other
+    /// control characters are dropped.
+    fn handle_paste(&mut self, text: String) {
+        self.last_paste_at = Some(Instant::now());
+        // Defensive: if a transport surfaced the bracketed-paste markers as
+        // literal text (seen on some Windows console paths), strip them.
+        let text = text
+            .replace("\u{1b}[200~", "")
+            .replace("\u{1b}[201~", "")
+            .replace("[200~", "")
+            .replace("[201~", "");
+        let cleaned: String = text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        self.history_idx = None; // a paste lands in a live buffer, not a history scrub
+        let at = byte_offset(&self.input, self.cursor_pos);
+        self.input.insert_str(at, &cleaned);
+        self.cursor_pos += cleaned.chars().count();
     }
 }
 
@@ -4576,6 +4638,18 @@ fn level_color(level: &str) -> Color {
 // Main loop
 // ---------------------------------------------------------------------------
 
+/// The literal text a key contributes inside a paste burst. Printable chars pass
+/// through; Enter/Tab flatten to a space (the input is single-line); everything
+/// else contributes nothing. Used to reassemble a Windows paste, which crossterm
+/// 0.28 delivers as a burst of Key events rather than an Event::Paste.
+fn key_burst_char(key: &KeyEvent, buf: &mut String) {
+    match key.code {
+        KeyCode::Char(c) => buf.push(c),
+        KeyCode::Enter | KeyCode::Tab => buf.push(' '),
+        _ => {}
+    }
+}
+
 fn main() -> io::Result<()> {
     // Install a panic hook that restores the terminal BEFORE the default
     // hook prints the backtrace. Without this, a panic while in raw mode +
@@ -4583,14 +4657,14 @@ fn main() -> io::Result<()> {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         prev_hook(info);
     }));
 
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -4606,12 +4680,53 @@ fn main() -> io::Result<()> {
 
         // Poll for events with 100ms timeout (allows periodic status refresh)
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                // Only handle Press events — Windows emits both Press and
-                // Release for each keystroke, causing double input.
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
+            match event::read()? {
+                // Unix (and Windows once crossterm gains VT input) deliver a
+                // paste as a single event.
+                Event::Paste(text) => app.handle_paste(text),
+                // Only handle Press events — Windows emits both Press and Release
+                // for each keystroke, which would otherwise double every input.
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // crossterm 0.28 has no Event::Paste on Windows: a paste lands
+                    // as a burst of Key events, and Windows Terminal often delivers
+                    // it in chunks (one per line) with a small gap at each line
+                    // break — whereas a human keypress is a singleton. Keep draining
+                    // as long as the next event arrives within a short window; this
+                    // bridges the inter-line gaps so the WHOLE multi-line paste
+                    // coalesces into one burst, its newlines becoming spaces in
+                    // handle_paste rather than an Enter that submits a half-line and
+                    // leaves the next line's leading 'q' to fire the quit shortcut. A
+                    // real keypress sees nothing follow within the window (its only
+                    // sibling is a Release we skip), so hotkeys/submit still work.
+                    let mut extra: Vec<KeyEvent> = Vec::new();
+                    while event::poll(Duration::from_millis(20))? {
+                        match event::read()? {
+                            Event::Key(k) if k.kind == KeyEventKind::Press => extra.push(k),
+                            Event::Paste(t) => app.handle_paste(t),
+                            _ => {} // Release / Repeat / resize — ignore
+                        }
+                    }
+                    if extra.is_empty() {
+                        app.handle_key(key); // singleton — normal hotkeys/commands
+                    } else {
+                        let mut burst = String::new();
+                        key_burst_char(&key, &mut burst);
+                        for k in &extra {
+                            key_burst_char(k, &mut burst);
+                        }
+                        if burst.is_empty() {
+                            // A burst of non-text keys (e.g. a held arrow) — replay
+                            // each so repeat semantics still work.
+                            app.handle_key(key);
+                            for k in extra {
+                                app.handle_key(k);
+                            }
+                        } else {
+                            app.handle_paste(burst);
+                        }
+                    }
                 }
+                _ => {}
             }
         }
 
@@ -4664,7 +4779,7 @@ fn main() -> io::Result<()> {
 
     // Restore terminal
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     // Reap every tracked child so none outlive the TUI:
     //   - bus child (kannaka swarm tail) — owned directly
     //   - chat child (kannaka chat --json REPL) — owned by its worker
