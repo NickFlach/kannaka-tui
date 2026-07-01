@@ -2724,7 +2724,7 @@ impl App {
                 // sets last_paste_at, so a normal Enter still submits.
                 let pasting = self
                     .last_paste_at
-                    .map_or(false, |t| t.elapsed() < Duration::from_millis(150));
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(150));
                 if pasting {
                     let at = byte_offset(&self.input, self.cursor_pos);
                     self.input.insert(at, ' ');
@@ -2821,7 +2821,13 @@ impl App {
             .replace("[201~", "");
         let cleaned: String = text
             .chars()
-            .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+            .map(|c| {
+                if c == '\n' || c == '\r' || c == '\t' {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .filter(|c| !c.is_control())
             .collect();
         if cleaned.is_empty() {
@@ -4779,7 +4785,11 @@ fn main() -> io::Result<()> {
 
     // Restore terminal
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     // Reap every tracked child so none outlive the TUI:
     //   - bus child (kannaka swarm tail) — owned directly
     //   - chat child (kannaka chat --json REPL) — owned by its worker
@@ -4971,5 +4981,239 @@ mod tests {
             tool_input_summary("grep", &j(r#"{"pattern":"TODO"}"#)),
             "TODO"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Golden NDJSON contract
+    //
+    // The TUI's whole contract with the kannaka binary is the NDJSON it reads
+    // from `kannaka agent --json`, `kannaka chat --json`, and `kannaka swarm
+    // tail`. The fixtures below are representative wire lines for each envelope
+    // / event the TUI parses; every field name + type here was checked against
+    // the producer in kannaka-memory (bin/handlers/agent.rs, handlers/chat.rs,
+    // handlers/swarm.rs, nats.rs, queen.rs). If kannaka-memory ever changes the
+    // shape, update these fixtures — and any TUI parse regression breaks here.
+    // -----------------------------------------------------------------------
+
+    /// `kannaka agent --json` — field-level extraction per kind.
+    /// `agent_event_parses_each_kind` pins the discriminants; this pins the
+    /// exact field NAMES the TUI reads out of the richer frames (so a producer
+    /// rename like `content`->`text` on tool_result would fail CI here).
+    #[test]
+    fn golden_agent_event_fields() {
+        let p = |s: &str| parse_agent_event(&serde_json::from_str(s).unwrap()).unwrap();
+
+        // ready: model / mode / cwd  (extra `tools` field is ignored)
+        let AgentEvent::Ready { model, mode, cwd } =
+            p(r#"{"kind":"ready","cwd":"/work","model":"claude","mode":"default","tools":[]}"#)
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(
+            (model.as_str(), mode.as_str(), cwd.as_str()),
+            ("claude", "default", "/work")
+        );
+
+        // tool_use: id / name / read_only / danger; summary derived from input
+        let AgentEvent::ToolUse {
+            id,
+            name,
+            summary,
+            read_only,
+            danger,
+        } = p(
+            r#"{"kind":"tool_use","id":"tu1","name":"bash","input":{"command":"ls -la"},"read_only":true,"danger":false}"#,
+        )
+        else {
+            panic!("expected ToolUse");
+        };
+        assert_eq!(id, "tu1");
+        assert_eq!(name, "bash");
+        assert_eq!(summary, "ls -la");
+        assert!(read_only);
+        assert!(!danger);
+
+        // tool_result: id / content / is_error  (producer's `name` is ignored)
+        let AgentEvent::ToolResult {
+            id,
+            content,
+            is_error,
+        } = p(
+            r#"{"kind":"tool_result","id":"tu1","name":"bash","content":"total 0","is_error":false}"#,
+        )
+        else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(id, "tu1");
+        assert_eq!(content, "total 0");
+        assert!(!is_error);
+
+        // approval_required: id / name / summary / danger
+        let AgentEvent::ApprovalRequired {
+            id,
+            name,
+            summary,
+            danger,
+        } = p(
+            r#"{"kind":"approval_required","id":"ap1","name":"write_file","summary":"a.txt","danger":true}"#,
+        )
+        else {
+            panic!("expected ApprovalRequired");
+        };
+        assert_eq!(id, "ap1");
+        assert_eq!(name, "write_file");
+        assert_eq!(summary, "a.txt");
+        assert!(danger);
+    }
+
+    /// `kannaka chat --json` — one JSON object per stdout line:
+    /// `{"kind": "chat"|"chunk"|"slash"|"error", "text": ".."}`. The chat-child
+    /// reader extracts exactly `v["kind"].as_str().unwrap_or("chat")` and
+    /// `v["text"].as_str().unwrap_or("")`; this pins those field names + the
+    /// documented fallbacks.
+    #[test]
+    fn golden_chat_response_fields() {
+        let fields = |line: &str| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = v["kind"].as_str().unwrap_or("chat").to_string();
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            (kind, text)
+        };
+        for (line, k, t) in [
+            (r#"{"kind":"chat","text":"hello"}"#, "chat", "hello"),
+            (r#"{"kind":"chunk","text":"par"}"#, "chunk", "par"),
+            (r#"{"kind":"slash","text":"/help"}"#, "slash", "/help"),
+            (r#"{"kind":"error","text":"boom"}"#, "error", "boom"),
+        ] {
+            let (kind, text) = fields(line);
+            assert_eq!(kind, k);
+            assert_eq!(text, t);
+        }
+        // Missing fields fall back the way the reader does.
+        assert_eq!(
+            fields(r#"{"text":"no kind"}"#),
+            ("chat".to_string(), "no kind".to_string())
+        );
+        assert_eq!(
+            fields(r#"{"kind":"chat"}"#),
+            ("chat".to_string(), String::new())
+        );
+    }
+
+    /// `kannaka swarm tail` — one JSON line per bus message:
+    /// `{"ts": <unix-ms>, "subject": "<subj>", "payload": <json|string>}`.
+    /// The bus reader pulls ts (i64 ms), subject (str, "?" when absent) and
+    /// payload (cloned, Null when absent), then routes by subject prefix.
+    #[test]
+    fn golden_swarm_tail_envelope() {
+        let line = r#"{"ts":1765400000000,"subject":"KANNAKA.activity.remember","payload":{"agent_id":"a1","content":"noted"}}"#;
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+        let subject = v
+            .get("subject")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let payload = v.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+        assert_eq!(ts, 1_765_400_000_000);
+        assert_eq!(subject, "KANNAKA.activity.remember");
+        assert!(payload.is_object());
+
+        // Absent fields degrade to the documented defaults.
+        let bare: serde_json::Value = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            bare.get("subject").and_then(|x| x.as_str()).unwrap_or("?"),
+            "?"
+        );
+        assert!(bare
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+            .is_null());
+    }
+
+    /// `QUEEN.phase.<id>` payloads (from a `swarm tail` line) feed
+    /// `agent_snapshot_from_payload`. The Rust publisher (queen.rs `AgentPhase`)
+    /// emits `phase`; the Kannaktopus arm emits `theta` — either is accepted.
+    /// Fields: agent_id, phase|theta, phi, coherence, order_parameter,
+    /// handedness (lowercase left|right|achiral), memory_count.
+    #[test]
+    fn golden_queen_phase_payload() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"agent_id":"kannaka-01","phase":1.25,"phi":0.42,"coherence":0.8,"order_parameter":0.7,"handedness":"left","memory_count":128}"#,
+        )
+        .unwrap();
+        let snap = agent_snapshot_from_payload("QUEEN.phase.kannaka-01", &payload).unwrap();
+        assert_eq!(snap.agent_id, "kannaka-01");
+        assert!(close(snap.theta, 1.25));
+        assert!(close(snap.phi, 0.42));
+        assert!(close(snap.coherence, 0.8));
+        assert!(close(snap.order_parameter, 0.7));
+        assert_eq!(snap.handedness, "left");
+        assert_eq!(snap.memory_count, 128);
+
+        // `theta` alias (Kannaktopus arm) is accepted in place of `phase`.
+        let arm: serde_json::Value =
+            serde_json::from_str(r#"{"agent_id":"topus","theta":2.0}"#).unwrap();
+        let s2 = agent_snapshot_from_payload("QUEEN.phase.topus", &arm).unwrap();
+        assert!(close(s2.theta, 2.0));
+
+        // agent_id falls back to the subject suffix when absent from the payload.
+        let noid: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let s3 = agent_snapshot_from_payload("QUEEN.phase.fromsub", &noid).unwrap();
+        assert_eq!(s3.agent_id, "fromsub");
+
+        // A non-object payload yields None.
+        let scalar: serde_json::Value = serde_json::from_str("42").unwrap();
+        assert!(agent_snapshot_from_payload("QUEEN.phase.x", &scalar).is_none());
+    }
+
+    /// `KANNAKA.dreams` payloads (from a `swarm tail` line) feed
+    /// `dream_event_from_payload`. Producer fields (kannaka.rs dream report):
+    /// agent_id, cycles, memories_strengthened, memories_pruned,
+    /// new_connections, hallucinations_created, consciousness_before,
+    /// consciousness_after, emerged.
+    #[test]
+    fn golden_dreams_payload() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"agent_id":"kannaka-01","cycles":3,"memories_strengthened":12,"memories_pruned":4,"new_connections":7,"hallucinations_created":1,"consciousness_before":0.30,"consciousness_after":0.55,"emerged":true}"#,
+        )
+        .unwrap();
+        let ev = dream_event_from_payload(1_765_400_000_000, &payload).unwrap();
+        assert_eq!(ev.ts_ms, 1_765_400_000_000);
+        assert_eq!(ev.agent_id, "kannaka-01");
+        assert_eq!(ev.cycles, 3);
+        assert_eq!(ev.strengthened, 12);
+        assert_eq!(ev.pruned, 4);
+        assert_eq!(ev.new_connections, 7);
+        assert_eq!(ev.hallucinations, 1);
+        assert!(close(ev.consciousness_before, 0.30));
+        assert!(close(ev.consciousness_after, 0.55));
+        assert!(ev.emerged);
+
+        // Non-object payload -> None.
+        assert!(dream_event_from_payload(0, &serde_json::Value::Null).is_none());
+    }
+
+    /// `summarize_payload` renders any bus payload into the Bus-tab one-liner.
+    /// It surfaces these known fields when present: agent_id, theta, phi, xi,
+    /// consciousness_level, content, event — else falls back to compact JSON.
+    #[test]
+    fn golden_summarize_payload_fields() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"agent_id":"a1","phi":0.5,"consciousness_level":"L5","event":"bloom"}"#,
+        )
+        .unwrap();
+        let s = summarize_payload("KANNAKA.events.bloom", &payload);
+        assert!(s.contains("agent=a1"), "got: {s}");
+        assert!(s.contains("\u{03A6}=0.500"), "got: {s}"); // Φ
+        assert!(s.contains("level=L5"), "got: {s}");
+        assert!(s.contains("event=bloom"), "got: {s}");
+
+        // An unknown-shape object still yields an informative compact-JSON line.
+        let opaque: serde_json::Value = serde_json::from_str(r#"{"weird":123}"#).unwrap();
+        assert!(summarize_payload("x", &opaque).contains("weird"));
     }
 }
