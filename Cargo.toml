@@ -1,6 +1,6 @@
 [package]
 name = "kannaka-tui"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Agent harness + dashboard for the Kannaka constellation — a coding agent (tools + approvals) over the `kannaka` CLI, plus Memory, Status, Bus, Constellation, Dreams, Chat, Cosmos tabs."
 license = "MIT"

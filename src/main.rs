@@ -515,9 +515,11 @@ Steps: \
 1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile \
 via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
 2) lab_ssh_configure on that instance to get its ssh alias. \
-3) lab_qos_boot with that ssh alias (it installs qemu/build deps, clones and builds QuantumOS, and boots \
-it in a detached tmux session on the instance) — report the boot tail, especially the 'QuantumOS ready' line \
-and timer ticks. \
+3) lab_qos_boot with that ssh alias and qseed='reservoir' (it installs qemu/build deps, clones and builds \
+QuantumOS, and boots it in a detached tmux session, seeding the kernel's quantum PRNG with real QPU bits \
+from the local entropy reservoir) — report the boot tail, especially the 'QuantumOS ready' line, the timer \
+ticks, and whether qseed_confirmed shows the kernel echoed the seed back; include the qseed provenance job \
+id. If the reservoir is empty, retry lab_qos_boot without qseed and say so plainly. \
 4) lab_watch with the same alias and session so a local terminal window opens showing the live serial console. \
 When done, remind me the instance keeps billing until lab_stop_instance.";
 
