@@ -532,7 +532,7 @@ Steps: \
 1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
 2) lab_ssh_configure on that instance to get its ssh alias. \
 3) lab_qos_boot with that ssh alias, graphical=true, and qseed='reservoir' (it installs qemu/build deps AND noVNC, clones and builds QuantumOS, and boots it PAUSED with a real VGA framebuffer over VNC, seeding the kernel's quantum PRNG with real QPU bits) — report the returned web_port and monitor_port, the qseed provenance job id, and whether qseed_confirmed is true. If the reservoir is empty, retry lab_qos_boot with graphical=true and no qseed, and say so plainly. \
-4) lab_watch with graphical=true and the same alias, passing the web_port and monitor_port from step 3 — it opens an SSH tunnel, launches my browser at the noVNC client, and resumes the paused VM so I watch the wave-interference boot splash animate live in my browser from the first frame. \
+4) lab_qos_watch with the same alias, passing the web_port and monitor_port from step 3 — it opens an SSH tunnel, launches my browser at the noVNC client, and resumes the paused VM so I watch the wave-interference boot splash animate live in my browser from the first frame. \
 When done, remind me the instance keeps billing until lab_stop_instance (or lab_terminate_instance for full teardown).";
 
 /// Handle to the spawned `kannaka chat --json` child. Stdin is held here
@@ -5318,13 +5318,13 @@ mod tests {
     /// here) breaks the build instead of silently confusing the agent.
     #[test]
     fn golden_qos_prompt_tool_names() {
+        // Tools common to both the serial and graphical /qos flows.
         for tool in [
             "lab_list_instances",
             "lab_list_profiles",
             "lab_provision_instance",
             "lab_ssh_configure",
             "lab_qos_boot",
-            "lab_watch",
             "lab_stop_instance",
         ] {
             assert!(
@@ -5336,7 +5336,17 @@ mod tests {
                 "QOS_BOOT_GRAPHICAL_PROMPT no longer mentions {tool}"
             );
         }
-        // The graphical prompt must actually ask for the graphical path.
+        // Serial watch = lab_watch (terminal); graphical watch = lab_qos_watch
+        // (browser). These are distinct tools on the kannaka-memory side.
+        assert!(
+            QOS_BOOT_PROMPT.contains("lab_watch"),
+            "QOS_BOOT_PROMPT must use lab_watch for the serial console"
+        );
+        assert!(
+            QOS_BOOT_GRAPHICAL_PROMPT.contains("lab_qos_watch"),
+            "QOS_BOOT_GRAPHICAL_PROMPT must use lab_qos_watch for the browser view"
+        );
+        // The graphical prompt must actually ask for the graphical boot.
         assert!(
             QOS_BOOT_GRAPHICAL_PROMPT.contains("graphical=true"),
             "QOS_BOOT_GRAPHICAL_PROMPT must request graphical=true"
