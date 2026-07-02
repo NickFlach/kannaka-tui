@@ -505,6 +505,22 @@ const AGENT_EVICT_WINDOW: Duration = Duration::from_secs(1200);
 /// than this when the tab is focused.
 const COSMOS_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
+/// Canned task injected by `/qos`: provision (or reuse) a qBraid Lab
+/// instance, boot QuantumOS in QEMU on it, and open a local spectator
+/// window on the serial console. The agent drives the whole flow with
+/// its lab_* tools; paid provisioning still goes through the normal
+/// spend approval — this string never bypasses a gate.
+const QOS_BOOT_PROMPT: &str = "Boot QuantumOS on a qBraid Lab instance and open a watch window for me. \
+Steps: \
+1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile \
+via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
+2) lab_ssh_configure on that instance to get its ssh alias. \
+3) lab_qos_boot with that ssh alias (it installs qemu/build deps, clones and builds QuantumOS, and boots \
+it in a detached tmux session on the instance) — report the boot tail, especially the 'QuantumOS ready' line \
+and timer ticks. \
+4) lab_watch with the same alias and session so a local terminal window opens showing the live serial console. \
+When done, remind me the instance keeps billing until lab_stop_instance.";
+
 /// Handle to the spawned `kannaka chat --json` child. Stdin is held here
 /// so the main thread can write user turns into it; stdout/stderr are
 /// owned by reader threads inside the spawn helper and dispatch events
@@ -1956,6 +1972,26 @@ impl App {
                     self.push_harness(AgentLine::Notice(format!(
                         "[model set to {m} — type a task to start]"
                     )));
+                }
+                Some("qos") => {
+                    if self.harness_pending.is_some() {
+                        self.push_harness(AgentLine::Notice(
+                            "[approval pending — press a (allow), s (allow always), or d (deny)]"
+                                .into(),
+                        ));
+                    } else if matches!(
+                        self.harness_status,
+                        HarnessStatus::Thinking | HarnessStatus::Starting
+                    ) {
+                        self.push_harness(AgentLine::Notice(
+                            "[agent is working — wait for it to finish or /stop]".into(),
+                        ));
+                    } else {
+                        self.push_harness(AgentLine::Notice(
+                            "[/qos — booting QuantumOS on a qBraid Lab instance]".into(),
+                        ));
+                        self.harness_user_turn(QOS_BOOT_PROMPT.to_string());
+                    }
                 }
                 Some(other) => self.push_harness(AgentLine::Notice(format!(
                     "[unknown command /{other} — try /help]"
@@ -4229,7 +4265,7 @@ fn render_harness_tab(f: &mut Frame, app: &App, area: Rect) {
             )
         } else {
             Span::styled(
-                "Enter run \u{2502} /stop /mode /yolo /plan /clear /model /help",
+                "Enter run \u{2502} /stop /mode /yolo /plan /clear /model /qos /help",
                 Style::default().fg(DIM),
             )
         },
@@ -4388,7 +4424,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     // Center the help box. Sized for the full tab + command set; the
     // Paragraph clips anything past the box on short terminals.
     let width = 80u16.min(area.width.saturating_sub(4));
-    let height = 62u16.min(area.height.saturating_sub(4));
+    let height = 63u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -4469,6 +4505,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled("        Switch model   ", dim),
             Span::styled("/clear", kbd),
             Span::styled(" Reset", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("   /qos", kbd),
+            Span::styled("               Boot QuantumOS on a qBraid Lab + watch window", dim),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Navigation", hdr)),
@@ -5244,5 +5284,26 @@ mod tests {
         // An unknown-shape object still yields an informative compact-JSON line.
         let opaque: serde_json::Value = serde_json::from_str(r#"{"weird":123}"#).unwrap();
         assert!(summarize_payload("x", &opaque).contains("weird"));
+    }
+
+    /// `/qos` injects a canned task that names specific backend lab tools.
+    /// Pin those names so a rename on the kannaka-memory side (or a typo
+    /// here) breaks the build instead of silently confusing the agent.
+    #[test]
+    fn golden_qos_prompt_tool_names() {
+        for tool in [
+            "lab_list_instances",
+            "lab_list_profiles",
+            "lab_provision_instance",
+            "lab_ssh_configure",
+            "lab_qos_boot",
+            "lab_watch",
+            "lab_stop_instance",
+        ] {
+            assert!(
+                QOS_BOOT_PROMPT.contains(tool),
+                "QOS_BOOT_PROMPT no longer mentions {tool}"
+            );
+        }
     }
 }
