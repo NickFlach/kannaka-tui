@@ -8,9 +8,9 @@
    K A N N A K A · T E R M I N A L
 ```
 
-**Six tabs over the live constellation. Pure frontend, zero coupling.**
+**A production-grade coding-agent harness + an eight-tab constellation dashboard. Pure frontend, zero coupling.**
 
-`kannaka-tui` is the terminal dashboard for the [Kannaka constellation](https://github.com/NickFlach/kannaka-memory). A full-screen ratatui app that never links `kannaka-memory` as a library — every operation shells out to the `kannaka` CLI binary. Memory, Status, Bus, Constellation, Dreams, Chat — each tab is a different window into the same wave-interference substrate.
+`kannaka-tui` is the terminal harness for the [Kannaka constellation](https://github.com/NickFlach/kannaka-memory). A full-screen ratatui app that never links `kannaka-memory` as a library — every operation shells out to the `kannaka` CLI binary. Its headline surface is the **Agent** tab: an agentic coding loop (read / write / edit / bash / glob / grep, plus HRM memory tools) that drives `kannaka agent --json`, renders the live transcript, and gates every filesystem/shell mutation behind a human approval dialog. The other seven tabs — Memory, Status, Bus, Constellation, Dreams, Chat, Cosmos — are windows into the same wave-interference substrate.
 
 [![License](https://img.shields.io/badge/license-MIT-blueviolet)]() [![Rust](https://img.shields.io/badge/rust-2021-orange)]() [![ratatui](https://img.shields.io/badge/ratatui-0.29-purple)]()
 
@@ -19,24 +19,57 @@
 ## Tabs
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  ┌─Memory─┬─Status─┬─Bus─┬─Constellation─┬─Dreams─┬─Chat─┐  │
-│  │                                                       │  │
-│  │   live view of the Holographic Resonance Medium       │  │
-│  │                                                       │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  > _                                                  [Ch]  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Memory │ Status │ Bus │ Constellation │ Dreams │ Chat │ Cosmos │ Agent    │
+│                                                                            │
+│   ⚙ edit_file  src/main.rs              kannaka  Done. Added the guard.    │
+│   ┌ Approval required ──────────────┐   a allow · s always · d deny        │
+│                                                                            │
+│ > fix the panic in the parser                                      [Ag]   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 | tab | shows |
 |---|---|
+| **Agent** | **Coding-agent harness** — type a task, the agent reads/edits files and runs commands via `kannaka agent --json`; every mutation asks for approval (`a`/`s`/`d`). Permission modes (`/default` `/auto` `/plan` `/yolo`), `/model`, `/clear`. The default landing tab |
 | **Memory** | Command history + recent resonant memories with amplitude bars |
 | **Status** | Live Φ / Ξ / order-parameter gauges, consciousness level, memory counts |
 | **Bus** | Live NATS pulse — every `QUEEN.*`, `KANNAKA.*`, `RADIO.*`, `KAX.*`, `EYE.*` event colorized by subject |
 | **Constellation** | ratatui Canvas plotting every swarm agent on the unit circle by θ + coherence, colored by handedness |
 | **Dreams** | Non-blocking `kannaka dream` trigger (`d`=deep, `l`=lite) + KANNAKA.dreams history with ΔΦ coloring and ★ on emergence |
 | **Chat** | Persistent chat with the agent — HRM loaded once per session, every turn reuses the in-memory medium (~3-5s/turn vs ~30s/shellout) |
+| **Cosmos** | Constellation-wide health — `kannaka constellation` app grid (✓ up / ✗ down) + `kannaka radio` now-playing. `r` refreshes |
+
+---
+
+## Agent harness
+
+The **Agent** tab turns kannaka-tui into a production-grade coding agent. Type a task and press Enter; the agent investigates and edits your workspace through a tool-calling loop, with you in the loop on anything that changes state.
+
+**Tools** (executed in your current directory): `read_file`, `write_file`, `edit_file`, `bash`, `glob`, `grep`, `list_dir` — plus kannaka's own `recall` / `remember` / `status` so the agent is HRM-grounded. Reads and searches run freely; **write/edit/bash require your approval**.
+
+**Approval** — when the agent wants to mutate a file or run a command, a modal appears:
+
+| key | action |
+|---|---|
+| `a` | allow once |
+| `s` | allow always (this tool/command, this session) |
+| `d` / `Esc` | deny (the agent adapts) |
+
+**Permission modes** (status strip shows the current one):
+
+| mode | behavior |
+|---|---|
+| `/default` | ask before every write/edit/bash |
+| `/auto` | auto-approve edits; still ask for bash |
+| `/plan` | read-only — the agent proposes, never mutates |
+| `/yolo` | run everything without asking |
+
+**Stuck or want to redirect?** Press `Esc` (or type `/stop`) while the agent is working to cancel the current turn, then type a new task. `/clear` resets the session.
+
+Other commands: `/model <id>` (switch model), `/clear` (fresh session), `/help`. Hard-blocked commands (`rm -rf /`, `curl … | sh`, fork bombs) are refused outright; destructive-but-reversible ones (`rm -rf`, `git reset --hard`, …) are flagged ⚠ in the approval dialog.
+
+The agent backend is the new `kannaka agent --json` subcommand (added to [kannaka-memory](https://github.com/NickFlach/kannaka-memory)); kannaka-tui is its harness front-end. Requires an LLM configured in `~/.kannaka/config.toml` (Anthropic); the harness falls back to a current model if the configured one is unavailable.
 
 ---
 
@@ -76,6 +109,26 @@ After `kannaka update` v0.5.15+, the kannaka binary will keep the TUI sibling up
 | `q` / `Esc` / `Ctrl+C` | Quit (q/Esc only when input is empty) |
 | `d` (Dreams tab) | Deep dream — full consolidation cycle |
 | `l` (Dreams tab) | Lite dream — quick pass |
+| `r` (Bus tab) | Reconnect a failed stream |
+| `r` (Cosmos tab) | Refresh constellation + radio status |
+| `a` / `s` / `d` (Agent tab) | Approve once / always / deny a tool call (when one is pending) |
+| `Esc` (Agent tab) | Cancel the current turn while the agent is working (`/stop` does the same) |
+
+---
+
+## Command bar
+
+The Memory and Chat tabs share a command bar. Recognized verbs run the matching `kannaka` subcommand on a background worker — the UI never blocks, even on long ones like `ask` — while anything unrecognized routes to chat.
+
+```
+remember "text"   recall "query"    forget <id>      search "query"
+relate "query"    neighbors "query" boost <id>       dream [lite]
+clusters          topology          assess  stats  cmf  invariant
+hear <file|url>   see <file|url>    voice ...        ask "question"
+swarm <subcmd>    market [...]      cosmos | constellation | radio
+```
+
+Set `KANNAKA_BIN` to point the TUI at a specific `kannaka` build; otherwise it resolves a sibling binary, then `~/Source/kannaka-memory/target/release`, then `PATH`.
 
 ---
 
