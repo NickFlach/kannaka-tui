@@ -486,6 +486,10 @@ const HARNESS_LINES_CAP: usize = 2000;
 /// `messages` otherwise grows unbounded across a long session; trim the
 /// oldest entries past this many.
 const MESSAGES_CAP: usize = 1000;
+/// Cap on the command-bar input history. `bus_lines`, `dream_history`, and
+/// `messages` are all bounded; `history` was the only unbounded collection.
+/// 500 entries covers any realistic session without truncating useful recall.
+const HISTORY_CAP: usize = 500;
 /// Agents not heard from in this window get rendered as ghost outlines
 /// instead of solid markers on the Constellation tab.
 const AGENT_FRESH_WINDOW: Duration = Duration::from_secs(120);
@@ -1900,9 +1904,12 @@ impl App {
             return;
         }
 
-        // Save to history
+        // Save to history, capped so the Vec never grows unbounded.
         self.history.push(input.clone());
         self.history_idx = None;
+        if self.history.len() > HISTORY_CAP {
+            self.history.remove(0);
+        }
 
         // Agent harness tab — drive the kannaka coding agent.
         if self.tabs.get(self.active_tab).copied() == Some("Agent") {
@@ -2560,6 +2567,11 @@ impl App {
     /// Side-effects on entering a tab — kicked off whether the user
     /// stepped forward (Tab) or backward (Shift+Tab).
     fn on_tab_enter(&mut self) {
+        // Shared scroll_offset is reset on every tab switch so entering a tab
+        // always shows the newest content rather than leaking the previous
+        // tab's scroll position (e.g. scrolled-up Memory → Chat hides newest
+        // messages).
+        self.scroll_offset = 0;
         match self.active_tab {
             1 => {
                 // Status — refresh metrics
