@@ -523,6 +523,18 @@ id. If the reservoir is empty, retry lab_qos_boot without qseed and say so plain
 4) lab_watch with the same alias and session so a local terminal window opens showing the live serial console. \
 When done, remind me the instance keeps billing until lab_stop_instance.";
 
+/// Canned task injected by `/qos --graphical`: same flow as QOS_BOOT_PROMPT but
+/// boots with a real VGA framebuffer over noVNC and opens a BROWSER watch
+/// window, so the wave-interference boot splash can be watched live. Paid
+/// provisioning still goes through the normal spend approval.
+const QOS_BOOT_GRAPHICAL_PROMPT: &str = "Boot QuantumOS on a qBraid Lab instance with a GRAPHICAL display and open a browser watch window for me. \
+Steps: \
+1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
+2) lab_ssh_configure on that instance to get its ssh alias. \
+3) lab_qos_boot with that ssh alias, graphical=true, and qseed='reservoir' (it installs qemu/build deps AND noVNC, clones and builds QuantumOS, and boots it PAUSED with a real VGA framebuffer over VNC, seeding the kernel's quantum PRNG with real QPU bits) — report the returned web_port and monitor_port, the qseed provenance job id, and whether qseed_confirmed is true. If the reservoir is empty, retry lab_qos_boot with graphical=true and no qseed, and say so plainly. \
+4) lab_watch with graphical=true and the same alias, passing the web_port and monitor_port from step 3 — it opens an SSH tunnel, launches my browser at the noVNC client, and resumes the paused VM so I watch the wave-interference boot splash animate live in my browser from the first frame. \
+When done, remind me the instance keeps billing until lab_stop_instance (or lab_terminate_instance for full teardown).";
+
 /// Handle to the spawned `kannaka chat --json` child. Stdin is held here
 /// so the main thread can write user turns into it; stdout/stderr are
 /// owned by reader threads inside the spawn helper and dispatch events
@@ -1975,7 +1987,11 @@ impl App {
                         "[model set to {m} — type a task to start]"
                     )));
                 }
-                Some("qos") => {
+                Some(c) if c == "qos" || c.starts_with("qos ") => {
+                    let graphical = {
+                        let rest = c.strip_prefix("qos").unwrap_or("").trim();
+                        rest == "--graphical" || rest == "-g" || rest == "graphical"
+                    };
                     if self.harness_pending.is_some() {
                         self.push_harness(AgentLine::Notice(
                             "[approval pending — press a (allow), s (allow always), or d (deny)]"
@@ -1989,10 +2005,19 @@ impl App {
                             "[agent is working — wait for it to finish or /stop]".into(),
                         ));
                     } else {
-                        self.push_harness(AgentLine::Notice(
-                            "[/qos — booting QuantumOS on a qBraid Lab instance]".into(),
-                        ));
-                        self.harness_user_turn(QOS_BOOT_PROMPT.to_string());
+                        let (notice, prompt) = if graphical {
+                            (
+                                "[/qos --graphical — booting QuantumOS with a live browser view]",
+                                QOS_BOOT_GRAPHICAL_PROMPT,
+                            )
+                        } else {
+                            (
+                                "[/qos — booting QuantumOS on a qBraid Lab instance]",
+                                QOS_BOOT_PROMPT,
+                            )
+                        };
+                        self.push_harness(AgentLine::Notice(notice.into()));
+                        self.harness_user_turn(prompt.to_string());
                     }
                 }
                 Some(other) => self.push_harness(AgentLine::Notice(format!(
@@ -5306,6 +5331,15 @@ mod tests {
                 QOS_BOOT_PROMPT.contains(tool),
                 "QOS_BOOT_PROMPT no longer mentions {tool}"
             );
+            assert!(
+                QOS_BOOT_GRAPHICAL_PROMPT.contains(tool),
+                "QOS_BOOT_GRAPHICAL_PROMPT no longer mentions {tool}"
+            );
         }
+        // The graphical prompt must actually ask for the graphical path.
+        assert!(
+            QOS_BOOT_GRAPHICAL_PROMPT.contains("graphical=true"),
+            "QOS_BOOT_GRAPHICAL_PROMPT must request graphical=true"
+        );
     }
 }
