@@ -533,7 +533,8 @@ Steps: \
 2) lab_ssh_configure on that instance to get its ssh alias. \
 3) lab_qos_boot with that ssh alias, graphical=true, and qseed='reservoir' (it installs qemu/build deps AND noVNC, clones and builds QuantumOS, and boots it PAUSED with a real VGA framebuffer over VNC, seeding the kernel's quantum PRNG with real QPU bits) — report the returned web_port and monitor_port, the qseed provenance job id, and whether qseed_confirmed is true. If the reservoir is empty, retry lab_qos_boot with graphical=true and no qseed, and say so plainly. \
 4) lab_qos_watch with the same alias, passing the web_port and monitor_port from step 3 — it opens an SSH tunnel, launches my browser at the noVNC client, and resumes the paused VM so I watch the wave-interference boot splash animate live in my browser from the first frame. \
-When done, remind me the instance keeps billing until lab_stop_instance (or lab_terminate_instance for full teardown).";
+5) lab_qos_swarm_bridge with the same ssh alias, session, and qseed — QuantumOS's ring-3 swarm service emits a Lamport-signed boot attestation on COM2 as it boots; this tails that COM2 log, verifies the attestation, and (only if it verifies) joins the NATS swarm under QuantumOS's OWN signed identity, refusing to join on a bad attestation. Report the joined agent-id and that I can confirm the node is live with `kannaka swarm peers`; note the join runs as a background daemon (join_pid) that holds the node's presence on the mesh until killed. \
+When done, remind me the instance keeps billing until lab_stop_instance (or lab_terminate_instance for full teardown), and that killing join_pid (or kannaka swarm leave) removes QuantumOS from the swarm.";
 
 /// Handle to the spawned `kannaka chat --json` child. Stdin is held here
 /// so the main thread can write user turns into it; stdout/stderr are
@@ -5350,6 +5351,12 @@ mod tests {
         assert!(
             QOS_BOOT_GRAPHICAL_PROMPT.contains("graphical=true"),
             "QOS_BOOT_GRAPHICAL_PROMPT must request graphical=true"
+        );
+        // Step 5: QuantumOS joins the swarm under its own signed identity. This
+        // tool is graphical-only (the serial flow keeps COM1 as its console).
+        assert!(
+            QOS_BOOT_GRAPHICAL_PROMPT.contains("lab_qos_swarm_bridge"),
+            "QOS_BOOT_GRAPHICAL_PROMPT must use lab_qos_swarm_bridge to join the swarm"
         );
     }
 }
