@@ -4761,6 +4761,38 @@ fn key_burst_char(key: &KeyEvent, buf: &mut String) {
 }
 
 fn main() -> io::Result<()> {
+    // Handle non-interactive flags BEFORE touching the terminal. Without
+    // this, ANY argument (`kannaka-tui --version`, `--help`) fell straight
+    // through to the full-screen TUI, which hangs when there is no
+    // interactive terminal (e.g. a version probe from `kannaka update` or a
+    // script) — there was no way to ask the binary its version.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kannaka-tui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "kannaka-tui {} — agent harness + dashboard for the Kannaka constellation",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!();
+        println!("Usage: kannaka-tui [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("  -V, --version   Print version and exit");
+        println!("  -h, --help      Print this help and exit");
+        println!();
+        println!(
+            "With no options, launches the interactive TUI (Agent, Memory, Status, Bus,"
+        );
+        println!(
+            "Constellation, Dreams, Chat, Cosmos tabs). Type /help inside for commands;"
+        );
+        println!("/qos boots QuantumOS on a qBraid instance (networked + clean console).");
+        return Ok(());
+    }
+
     // Install a panic hook that restores the terminal BEFORE the default
     // hook prints the backtrace. Without this, a panic while in raw mode +
     // alt screen leaves the user's terminal wedged (no echo, no prompt).
