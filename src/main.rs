@@ -1966,13 +1966,13 @@ impl App {
         if self.tabs.get(self.active_tab).copied() == Some("Agent") {
             let cmd = input.strip_prefix('/').map(str::trim);
             match cmd {
-                Some("help") | Some("?") => self.show_help = true,
-                Some("quit") | Some("exit") | Some("q") => self.should_quit = true,
+                Some("help" | "?") => self.show_help = true,
+                Some("quit" | "exit" | "q") => self.should_quit = true,
                 Some("yolo") => self.set_harness_mode("yolo"),
                 Some("plan") => self.set_harness_mode("plan"),
                 Some("default") => self.set_harness_mode("default"),
-                Some("auto") | Some("auto-edit") => self.set_harness_mode("auto-edit"),
-                Some("stop") | Some("cancel") => self.stop_harness(),
+                Some("auto" | "auto-edit") => self.set_harness_mode("auto-edit"),
+                Some("stop" | "cancel") => self.stop_harness(),
                 Some("clear") => {
                     self.restart_harness();
                     self.harness_lines.clear();
@@ -2691,13 +2691,11 @@ impl App {
         // is empty so users can still type commands like `dream lite`.
         if self.active_tab == 4 && self.input.is_empty() {
             match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('d'))
-                | (KeyModifiers::NONE, KeyCode::Char('D')) => {
+                (KeyModifiers::NONE, KeyCode::Char('d' | 'D')) => {
                     self.start_dream("deep");
                     return;
                 }
-                (KeyModifiers::NONE, KeyCode::Char('l'))
-                | (KeyModifiers::NONE, KeyCode::Char('L')) => {
+                (KeyModifiers::NONE, KeyCode::Char('l' | 'L')) => {
                     self.start_dream("lite");
                     return;
                 }
@@ -2708,25 +2706,17 @@ impl App {
         // Bus tab: 'r' reconnects a failed stream (empty input only) so a
         // transient NATS blip doesn't require restarting the TUI.
         if self.active_tab == 2 && self.input.is_empty() && self.bus_status == BusStatus::Failed {
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('r'))
-                | (KeyModifiers::NONE, KeyCode::Char('R')) => {
-                    self.restart_bus();
-                    return;
-                }
-                _ => {}
+            if let (KeyModifiers::NONE, KeyCode::Char('r' | 'R')) = (key.modifiers, key.code) {
+                self.restart_bus();
+                return;
             }
         }
 
         // Cosmos tab: 'r' forces a constellation/radio refresh (empty input).
         if self.active_tab == 6 && self.input.is_empty() {
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('r'))
-                | (KeyModifiers::NONE, KeyCode::Char('R')) => {
-                    self.load_cosmos();
-                    return;
-                }
-                _ => {}
+            if let (KeyModifiers::NONE, KeyCode::Char('r' | 'R')) = (key.modifiers, key.code) {
+                self.load_cosmos();
+                return;
             }
         }
 
@@ -2735,19 +2725,15 @@ impl App {
         // approval instead of quitting the TUI.
         if self.active_tab == 7 && self.harness_pending.is_some() && self.input.is_empty() {
             match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('a'))
-                | (KeyModifiers::NONE, KeyCode::Char('A')) => {
+                (KeyModifiers::NONE, KeyCode::Char('a' | 'A')) => {
                     self.resolve_approval("allow");
                     return;
                 }
-                (KeyModifiers::NONE, KeyCode::Char('s'))
-                | (KeyModifiers::NONE, KeyCode::Char('S')) => {
+                (KeyModifiers::NONE, KeyCode::Char('s' | 'S')) => {
                     self.resolve_approval("allow_always");
                     return;
                 }
-                (KeyModifiers::NONE, KeyCode::Char('d'))
-                | (KeyModifiers::NONE, KeyCode::Char('D'))
-                | (KeyModifiers::NONE, KeyCode::Esc) => {
+                (KeyModifiers::NONE, KeyCode::Char('d' | 'D') | KeyCode::Esc) => {
                     self.resolve_approval("deny");
                     return;
                 }
@@ -2778,8 +2764,7 @@ impl App {
         // a literal command. Always available regardless of active tab.
         if self.input.is_empty() {
             match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('q'))
-                | (KeyModifiers::NONE, KeyCode::Char('Q')) => {
+                (KeyModifiers::NONE, KeyCode::Char('q' | 'Q')) => {
                     self.should_quit = true;
                     return;
                 }
@@ -2803,7 +2788,7 @@ impl App {
             }
             // Most terminals deliver Shift+Tab as BackTab with NONE modifier;
             // also accept SHIFT+BackTab for terminals that set the modifier.
-            (KeyModifiers::NONE, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::BackTab) => {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::BackTab) => {
                 if self.active_tab == 0 {
                     self.active_tab = self.tabs.len() - 1;
                 } else {
