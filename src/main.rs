@@ -506,7 +506,9 @@ const AGENT_EVICT_WINDOW: Duration = Duration::from_secs(1200);
 const COSMOS_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Canned task injected by `/qos`: provision (or reuse) a qBraid Lab
-/// instance, boot QuantumOS in QEMU on it, and open a local spectator
+/// instance, boot QuantumOS in QEMU on it — networked (rtl8139 on SLIRP,
+/// so the full net stack runs and the shell's http/nslookup/udping work)
+/// and quiet (clean interactive console) — and open a local spectator
 /// window on the serial console. The agent drives the whole flow with
 /// its lab_* tools; paid provisioning still goes through the normal
 /// spend approval — this string never bypasses a gate.
@@ -515,12 +517,17 @@ Steps: \
 1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile \
 via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
 2) lab_ssh_configure on that instance to get its ssh alias. \
-3) lab_qos_boot with that ssh alias and qseed='reservoir' (it installs qemu/build deps, clones and builds \
-QuantumOS, and boots it in a detached tmux session, seeding the kernel's quantum PRNG with real QPU bits \
-from the local entropy reservoir) — report the boot tail, especially the 'QuantumOS ready' line, the timer \
-ticks, and whether qseed_confirmed shows the kernel echoed the seed back; include the qseed provenance job \
-id. If the reservoir is empty, retry lab_qos_boot without qseed and say so plainly. \
-4) lab_watch with the same alias and session so a local terminal window opens showing the live serial console. \
+3) lab_qos_boot with that ssh alias, network=true, quiet=true, and qseed='reservoir' (it installs qemu/build \
+deps, clones and builds QuantumOS, and boots it in a detached tmux session with an rtl8139 NIC on user-mode \
+networking AND a quiet kernel console — so the boot self-test runs the full network stack (ARP/DHCP/ICMP/DNS) \
+and the ring-3 shell's nslookup/udping/http work against the real internet, while the demo kernel's \
+steady-state chatter is silenced for a clean interactive qsh prompt; the quantum PRNG is seeded with real QPU \
+bits from the local entropy reservoir) — report the boot tail, especially the 'QuantumOS ready' line and the \
+'NET: DHCP lease 10.0.2.15' line, and whether qseed_confirmed shows the kernel echoed the seed back; include \
+the qseed provenance job id. If the reservoir is empty, retry lab_qos_boot with network=true and quiet=true \
+and no qseed, and say so plainly. \
+4) lab_watch with the same alias and session so a local terminal window opens showing the live serial console \
+— a clean qsh prompt where I can type 'http example.com', 'nslookup', 'udping', etc. \
 When done, remind me the instance keeps billing until lab_stop_instance.";
 
 /// Canned task injected by `/qos --graphical`: same flow as QOS_BOOT_PROMPT but
@@ -531,7 +538,7 @@ const QOS_BOOT_GRAPHICAL_PROMPT: &str = "Boot QuantumOS on a qBraid Lab instance
 Steps: \
 1) lab_list_instances — if an instance is already running, reuse it; otherwise pick a cheap CPU profile via lab_list_profiles and lab_provision_instance (wait for it to be ready). \
 2) lab_ssh_configure on that instance to get its ssh alias. \
-3) lab_qos_boot with that ssh alias, graphical=true, and qseed='reservoir' (it installs qemu/build deps AND noVNC, clones and builds QuantumOS, and boots it PAUSED with a real VGA framebuffer over VNC, seeding the kernel's quantum PRNG with real QPU bits) — report the returned web_port and monitor_port, the qseed provenance job id, and whether qseed_confirmed is true. If the reservoir is empty, retry lab_qos_boot with graphical=true and no qseed, and say so plainly. \
+3) lab_qos_boot with that ssh alias, graphical=true, network=true, and qseed='reservoir' (it installs qemu/build deps AND noVNC, clones and builds QuantumOS, and boots it PAUSED with a real VGA framebuffer over VNC AND an rtl8139 NIC on user-mode networking, so the boot self-test runs the full network stack — ARP/DHCP/ICMP/DNS against the real internet — as I watch, seeding the kernel's quantum PRNG with real QPU bits) — report the returned web_port and monitor_port, the qseed provenance job id, and whether qseed_confirmed is true. If the reservoir is empty, retry lab_qos_boot with graphical=true and network=true and no qseed, and say so plainly. \
 4) lab_qos_watch with the same alias, passing the web_port and monitor_port from step 3 — it opens an SSH tunnel, launches my browser at the noVNC client, and resumes the paused VM so I watch the wave-interference boot splash animate live in my browser from the first frame. \
 5) lab_qos_swarm_bridge with the same ssh alias, session, and qseed — QuantumOS's ring-3 swarm service emits a Lamport-signed boot attestation on COM2 as it boots; this tails that COM2 log, verifies the attestation, and (only if it verifies) joins the NATS swarm under QuantumOS's OWN signed identity, refusing to join on a bad attestation. Report the joined agent-id and that I can confirm the node is live with `kannaka swarm peers`; note the join runs as a background daemon (join_pid) that holds the node's presence on the mesh until killed. \
 When done, remind me the instance keeps billing until lab_stop_instance (or lab_terminate_instance for full teardown), and that killing join_pid (or kannaka swarm leave) removes QuantumOS from the swarm.";
