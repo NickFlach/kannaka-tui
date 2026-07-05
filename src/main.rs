@@ -139,9 +139,9 @@ fn parse_constellation_line(line: &str) -> Option<CosmosApp> {
 fn clean_radio_lines(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(String::from)
         .take(4)
         .collect()
 }
@@ -1801,7 +1801,7 @@ impl App {
         let (tx, rx) = mpsc::channel::<CmdResult>();
         self.passthrough_pending = Some(rx);
         std::thread::spawn(move || {
-            let arg_refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+            let arg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
             let result = run_capture(&bin, &arg_refs, Duration::from_secs(timeout_secs));
             let cmd_result = match result {
                 Ok(out) if out.status.success() => {
@@ -1957,7 +1957,7 @@ impl App {
 
         // Agent harness tab — drive the kannaka coding agent.
         if self.tabs.get(self.active_tab).copied() == Some("Agent") {
-            let cmd = input.strip_prefix('/').map(|s| s.trim());
+            let cmd = input.strip_prefix('/').map(str::trim);
             match cmd {
                 Some("help") | Some("?") => self.show_help = true,
                 Some("quit") | Some("exit") | Some("q") => self.should_quit = true,
@@ -3714,8 +3714,8 @@ fn agent_snapshot_from_payload(
     let agent_id = obj
         .get("agent_id")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| subject.strip_prefix("QUEEN.phase.").map(|s| s.to_string()))?;
+        .map(String::from)
+        .or_else(|| subject.strip_prefix("QUEEN.phase.").map(String::from))?;
     // The Rust kannaka publishes `phase` (radians); the Kannaktopus arm
     // publishes `theta` (also radians). Accept either.
     let theta = obj
