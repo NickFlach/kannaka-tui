@@ -676,8 +676,7 @@ impl App {
             messages: vec![Message {
                 role: Role::System,
                 content: format!(
-                    "Welcome to Kannaka TUI. Agent: {}. Type a command or press F1 for help.",
-                    agent_name
+                    "Welcome to Kannaka TUI. Agent: {agent_name}. Type a command or press F1 for help."
                 ),
             }],
             memories: Vec::new(),
@@ -1556,7 +1555,7 @@ impl App {
     fn execute_remember(&mut self, text: &str) {
         self.push_message(Message {
             role: Role::User,
-            content: format!("remember \"{}\"", text),
+            content: format!("remember \"{text}\""),
         });
         if self.cmd_busy() {
             return;
@@ -1574,7 +1573,7 @@ impl App {
                     CmdResult {
                         messages: vec![Message {
                             role: Role::Result,
-                            content: format!("Stored (id: {})", id),
+                            content: format!("Stored (id: {id})"),
                         }],
                         refresh_observe: true,
                     }
@@ -1592,7 +1591,7 @@ impl App {
                 Err(e) => CmdResult {
                     messages: vec![Message {
                         role: Role::Error,
-                        content: format!("Failed to run kannaka: {}", e),
+                        content: format!("Failed to run kannaka: {e}"),
                     }],
                     refresh_observe: false,
                 },
@@ -1604,7 +1603,7 @@ impl App {
     fn execute_recall(&mut self, query: &str) {
         self.push_message(Message {
             role: Role::User,
-            content: format!("recall \"{}\"", query),
+            content: format!("recall \"{query}\""),
         });
         if self.cmd_busy() {
             return;
@@ -1662,7 +1661,7 @@ impl App {
                 Err(e) => {
                     messages.push(Message {
                         role: Role::Error,
-                        content: format!("Failed: {}", e),
+                        content: format!("Failed: {e}"),
                     });
                 }
             }
@@ -1702,7 +1701,7 @@ impl App {
     fn execute_forget(&mut self, query: &str) {
         self.push_message(Message {
             role: Role::User,
-            content: format!("forget \"{}\"", query),
+            content: format!("forget \"{query}\""),
         });
         if self.cmd_busy() {
             return;
@@ -1738,7 +1737,7 @@ impl App {
                 Err(e) => CmdResult {
                     messages: vec![Message {
                         role: Role::Error,
-                        content: format!("Failed: {}", e),
+                        content: format!("Failed: {e}"),
                     }],
                     refresh_observe: false,
                 },
@@ -1794,7 +1793,7 @@ impl App {
         }
         self.push_message(Message {
             role: Role::System,
-            content: format!("Running... (up to {}s)", timeout_secs),
+            content: format!("Running... (up to {timeout_secs}s)"),
         });
 
         // Run on a worker with a wall-clock timeout and report back via
@@ -2133,23 +2132,23 @@ impl App {
                 // hear can take ~30-60s for stream sampling + decode + HRM
                 // absorb. Give it 5 min wall-clock so /stream sampling at
                 // --secs 60 has comfortable headroom.
-                self.execute_passthrough(&format!("hear {}", rest), &args, 300);
+                self.execute_passthrough(&format!("hear {rest}"), &args, 300);
             }
         } else if let Some(q) = cmd_input.strip_prefix("ask ") {
             let q = q.trim().trim_matches('"');
             // ask runs through Anthropic; budget 10 min like the radio's
             // peace-oration path so transient overload retries fit.
             self.execute_passthrough(
-                &format!("ask \"{}\"", q),
+                &format!("ask \"{q}\""),
                 &["ask", "--no-tools", "--quiet-tools", q],
                 600,
             );
         } else if let Some(q) = cmd_input.strip_prefix("search ") {
             let q = q.trim().trim_matches('"');
-            self.execute_passthrough(&format!("search \"{}\"", q), &["search", q], 30);
+            self.execute_passthrough(&format!("search \"{q}\""), &["search", q], 30);
         } else if let Some(id) = cmd_input.strip_prefix("boost ") {
             let id = id.trim();
-            self.execute_passthrough(&format!("boost {}", id), &["boost", id], 30);
+            self.execute_passthrough(&format!("boost {id}"), &["boost", id], 30);
         } else if cmd_input == "assess" {
             self.execute_passthrough("assess", &["assess"], 60);
         } else if cmd_input == "stats" {
@@ -2175,10 +2174,10 @@ impl App {
             self.execute_passthrough(cmd_input, &parts, 60);
         } else if let Some(q) = cmd_input.strip_prefix("relate ") {
             let q = q.trim().trim_matches('"');
-            self.execute_passthrough(&format!("relate \"{}\"", q), &["relate", q], 60);
+            self.execute_passthrough(&format!("relate \"{q}\""), &["relate", q], 60);
         } else if let Some(q) = cmd_input.strip_prefix("neighbors ") {
             let q = q.trim().trim_matches('"');
-            self.execute_passthrough(&format!("neighbors \"{}\"", q), &["neighbors", q], 60);
+            self.execute_passthrough(&format!("neighbors \"{q}\""), &["neighbors", q], 60);
         } else if cmd_input == "clusters" || cmd_input.starts_with("clusters ") {
             let parts: Vec<&str> = cmd_input.split_whitespace().collect();
             self.execute_passthrough(cmd_input, &parts, 60);
@@ -2199,7 +2198,7 @@ impl App {
                     .chain(rest.split_whitespace())
                     .collect();
                 // Visual absorb — decode + wavefront embed can take a while.
-                self.execute_passthrough(&format!("see {}", rest), &parts, 300);
+                self.execute_passthrough(&format!("see {rest}"), &parts, 300);
             }
         } else if cmd_input == "constellation"
             || cmd_input == "cosmos"
@@ -2471,7 +2470,7 @@ impl App {
         if let Some(ref mut handle) = self.chat_child {
             if let Some(ref mut stdin) = handle.stdin {
                 use std::io::Write;
-                let _ = writeln!(stdin, "{}", user_msg);
+                let _ = writeln!(stdin, "{user_msg}");
                 let _ = stdin.flush();
                 self.chat_pending = Some(std::sync::mpsc::channel().1); // sentinel: a turn is in flight
                 return;
@@ -2988,13 +2987,13 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled("Phi: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:.3}", phi), Style::default().fg(phi_color(phi))),
+        Span::styled(format!("{phi:.3}"), Style::default().fg(phi_color(phi))),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled("Xi: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:.3}", xi), Style::default().fg(INFO)),
+        Span::styled(format!("{xi:.3}"), Style::default().fg(INFO)),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled("r: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:.3}", order), Style::default().fg(SUCCESS)),
+        Span::styled(format!("{order:.3}"), Style::default().fg(SUCCESS)),
     ]);
 
     let block = Block::default()
@@ -3089,7 +3088,7 @@ fn render_memory_tab(f: &mut Frame, app: &App, area: Rect) {
             let preview: String = m.content.chars().take(24).collect();
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{}{}", bar, empty),
+                    format!("{bar}{empty}"),
                     Style::default().fg(amplitude_color(m.amplitude)),
                 ),
                 Span::styled(" ", Style::default()),
@@ -3112,19 +3111,19 @@ fn render_memory_tab(f: &mut Frame, app: &App, area: Rect) {
     // Add a separator and stats
     right_lines.push(ListItem::new(Line::from("")));
     right_lines.push(ListItem::new(Line::from(vec![Span::styled(
-        format!("  Memories: {}", mem_count),
+        format!("  Memories: {mem_count}"),
         Style::default().fg(DIM),
     )])));
     right_lines.push(ListItem::new(Line::from(vec![Span::styled(
-        format!("  Clusters: {}", cluster_count),
+        format!("  Clusters: {cluster_count}"),
         Style::default().fg(DIM),
     )])));
     right_lines.push(ListItem::new(Line::from(vec![Span::styled(
-        format!("  Links: {}", link_count),
+        format!("  Links: {link_count}"),
         Style::default().fg(DIM),
     )])));
     right_lines.push(ListItem::new(Line::from(vec![Span::styled(
-        format!("  Level: {}", level),
+        format!("  Level: {level}"),
         Style::default().fg(level_color(level)),
     )])));
 
@@ -3356,7 +3355,7 @@ fn render_dreams_tab(f: &mut Frame, app: &App, area: Rect) {
                             mode.clone(),
                             Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("    elapsed: {}s", secs), Style::default().fg(DIM)),
+                        Span::styled(format!("    elapsed: {secs}s"), Style::default().fg(DIM)),
                     ]),
                     Line::from(Span::styled(
                         "  Consolidating the medium — TUI stays responsive while this runs.",
@@ -3452,7 +3451,7 @@ fn render_dreams_tab(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(format!("{:>6}  ", ev.cycles), Style::default().fg(TEXT)),
             Span::styled(
-                format!("{:>+5.3} ", delta_phi),
+                format!("{delta_phi:>+5.3} "),
                 Style::default().fg(phi_color),
             ),
             Span::styled(
@@ -3536,7 +3535,7 @@ fn render_chat_tab(f: &mut Frame, app: &App, area: Rect) {
             ChatWho::System => ("·", Style::default().fg(DIM)),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{} ", label), style),
+            Span::styled(format!("{label} "), style),
             Span::styled(msg.text.clone(), Style::default().fg(TEXT)),
         ]));
         lines.push(Line::from(""));
@@ -3640,13 +3639,13 @@ fn summarize_payload(subject: &str, payload: &serde_json::Value) -> String {
             bits.push(format!("agent={agent}"));
         }
         if let Some(theta) = obj.get("theta").and_then(|v| v.as_f64()) {
-            bits.push(format!("θ={:.3}", theta));
+            bits.push(format!("θ={theta:.3}"));
         }
         if let Some(phi) = obj.get("phi").and_then(|v| v.as_f64()) {
-            bits.push(format!("Φ={:.3}", phi));
+            bits.push(format!("Φ={phi:.3}"));
         }
         if let Some(xi) = obj.get("xi").and_then(|v| v.as_f64()) {
-            bits.push(format!("Ξ={:.3}", xi));
+            bits.push(format!("Ξ={xi:.3}"));
         }
         if let Some(level) = obj.get("consciousness_level").and_then(|v| v.as_str()) {
             bits.push(format!("level={level}"));
@@ -3929,7 +3928,7 @@ fn render_constellation_tab(f: &mut Frame, app: &App, area: Rect) {
         let r = snap.coherence.max(snap.order_parameter);
         let stale_mark = if fresh { " " } else { "·" };
         rows.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{} ", stale_mark), Style::default().fg(DIM)),
+            Span::styled(format!("{stale_mark} "), Style::default().fg(DIM)),
             Span::styled(
                 format!("{:<14}", truncate(&snap.agent_id, 14)),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -3984,7 +3983,7 @@ fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(DIM)
             };
-            radio_lines.push(Line::from(Span::styled(format!("  {}", l), style)));
+            radio_lines.push(Line::from(Span::styled(format!("  {l}"), style)));
         }
     }
     let radio = Paragraph::new(radio_lines)
@@ -4005,7 +4004,7 @@ fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
     let mut app_lines: Vec<Line> = Vec::new();
     if let Some(err) = &app.cosmos_error {
         app_lines.push(Line::from(Span::styled(
-            format!("  {}", err),
+            format!("  {err}"),
             Style::default().fg(ERROR),
         )));
     } else if app.cosmos_apps.is_empty() {
@@ -4021,7 +4020,7 @@ fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
         let up = app.cosmos_apps.iter().filter(|a| a.up).count();
         let total = app.cosmos_apps.len();
         app_lines.push(Line::from(Span::styled(
-            format!("  {}/{} apps up", up, total),
+            format!("  {up}/{total} apps up"),
             Style::default().fg(DIM).add_modifier(Modifier::BOLD),
         )));
         app_lines.push(Line::from(""));
@@ -4034,7 +4033,7 @@ fn render_cosmos_tab(f: &mut Frame, app: &App, area: Rect) {
             let name_color = if a.up { TEXT } else { DIM };
             app_lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {} ", mark),
+                    format!("  {mark} "),
                     Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -4424,7 +4423,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(BG))
         .title_bottom(Line::from(Span::styled(
-            format!(" {} ", tab_indicator),
+            format!(" {tab_indicator} "),
             Style::default().fg(DIM),
         )));
 
