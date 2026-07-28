@@ -101,10 +101,10 @@ fn parse_constellation_line(line: &str) -> Option<CosmosApp> {
     let t = line.trim();
     let (up, rest) = if let Some(r) = t.strip_prefix('\u{2713}') {
         (true, r) // ✓
-    } else if let Some(r) = t.strip_prefix('\u{2717}') {
-        (false, r) // ✗
     } else {
-        return None;
+        // Not a ✓ line, so it must be a ✗ line — anything else (header,
+        // divider, blank) is not an app row and yields None.
+        (false, t.strip_prefix('\u{2717}')?) // ✗
     };
     let rest = rest.trim();
     if rest.is_empty() {
