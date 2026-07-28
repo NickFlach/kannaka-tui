@@ -4783,12 +4783,8 @@ fn main() -> io::Result<()> {
         println!("  -V, --version   Print version and exit");
         println!("  -h, --help      Print this help and exit");
         println!();
-        println!(
-            "With no options, launches the interactive TUI (Agent, Memory, Status, Bus,"
-        );
-        println!(
-            "Constellation, Dreams, Chat, Cosmos tabs). Type /help inside for commands;"
-        );
+        println!("With no options, launches the interactive TUI (Agent, Memory, Status, Bus,");
+        println!("Constellation, Dreams, Chat, Cosmos tabs). Type /help inside for commands;");
         println!("/qos boots QuantumOS on a qBraid instance (networked + clean console).");
         return Ok(());
     }
