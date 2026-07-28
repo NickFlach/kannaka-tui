@@ -101,10 +101,10 @@ fn parse_constellation_line(line: &str) -> Option<CosmosApp> {
     let t = line.trim();
     let (up, rest) = if let Some(r) = t.strip_prefix('\u{2713}') {
         (true, r) // ✓
-    } else if let Some(r) = t.strip_prefix('\u{2717}') {
-        (false, r) // ✗
     } else {
-        return None;
+        // Not a ✓ line, so it must be a ✗ line — anything else (header,
+        // divider, blank) is not an app row and yields None.
+        (false, t.strip_prefix('\u{2717}')?) // ✗
     };
     let rest = rest.trim();
     if rest.is_empty() {
@@ -4783,12 +4783,8 @@ fn main() -> io::Result<()> {
         println!("  -V, --version   Print version and exit");
         println!("  -h, --help      Print this help and exit");
         println!();
-        println!(
-            "With no options, launches the interactive TUI (Agent, Memory, Status, Bus,"
-        );
-        println!(
-            "Constellation, Dreams, Chat, Cosmos tabs). Type /help inside for commands;"
-        );
+        println!("With no options, launches the interactive TUI (Agent, Memory, Status, Bus,");
+        println!("Constellation, Dreams, Chat, Cosmos tabs). Type /help inside for commands;");
         println!("/qos boots QuantumOS on a qBraid instance (networked + clean console).");
         return Ok(());
     }
