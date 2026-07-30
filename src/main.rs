@@ -750,7 +750,7 @@ impl App {
             return;
         }
         let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".into());
         self.harness_cwd = cwd.clone();
         self.harness_status = HarnessStatus::Starting;
@@ -1304,11 +1304,11 @@ impl App {
             if let Some(dir) = exe.parent() {
                 let sibling = dir.join("kannaka.exe");
                 if sibling.exists() {
-                    return sibling.to_string_lossy().to_string();
+                    return sibling.to_string_lossy().into_owned();
                 }
                 let sibling = dir.join("kannaka");
                 if sibling.exists() {
-                    return sibling.to_string_lossy().to_string();
+                    return sibling.to_string_lossy().into_owned();
                 }
             }
         }
@@ -1318,7 +1318,7 @@ impl App {
             for name in &["kannaka.exe", "kannaka"] {
                 let candidate = base.join(name);
                 if candidate.exists() {
-                    return candidate.to_string_lossy().to_string();
+                    return candidate.to_string_lossy().into_owned();
                 }
             }
         }
@@ -1641,7 +1641,7 @@ impl App {
                             let preview: String = content.chars().take(60).collect();
                             messages.push(Message {
                                 role: Role::Result,
-                                content: format!("  {}. {} ({:.2})", i + 1, preview, sim),
+                                content: format!("  {}. {preview} ({sim:.2})", i + 1),
                             });
                         }
                     } else {
@@ -3093,7 +3093,7 @@ fn render_memory_tab(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(" ", Style::default()),
                 Span::styled(
-                    format!("{} ({:.2})", preview, m.amplitude),
+                    format!("{preview} ({:.2})", m.amplitude),
                     Style::default().fg(TEXT),
                 ),
             ]))
@@ -3105,7 +3105,7 @@ fn render_memory_tab(f: &mut Frame, app: &App, area: Rect) {
     let mem_count = status.map_or(0, |s| s.memories);
     let cluster_count = status.map_or(0, |s| s.clusters);
     let link_count = status.map_or(0, |s| s.links);
-    let level = status.map(|s| s.level.as_str()).unwrap_or("Unknown");
+    let level = status.map_or("Unknown", |s| s.level.as_str());
 
     let mut right_lines: Vec<ListItem> = mem_items;
     // Add a separator and stats
@@ -3612,7 +3612,7 @@ fn render_bus_tab(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!(" Bus · {} · {} msgs ", status_label, app.bus_lines.len());
+    let title = format!(" Bus · {status_label} · {} msgs ", app.bus_lines.len());
     let body = Paragraph::new(lines)
         .block(
             Block::default()
