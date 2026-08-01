@@ -122,8 +122,7 @@ fn parse_constellation_line(line: &str) -> Option<CosmosApp> {
                 .char_indices()
                 .rev()
                 .find(|(_, c)| c.is_whitespace())
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
+                .map_or(0, |(i, c)| i + c.len_utf8());
             (
                 rest[..url_start].trim().to_string(),
                 rest[url_start..].trim().to_string(),
@@ -298,8 +297,8 @@ enum HarnessStatus {
 fn parse_agent_event(v: &serde_json::Value) -> Option<AgentEvent> {
     let kind = v.get("kind")?.as_str()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    let b = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let b = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
     Some(match kind {
         "ready" => AgentEvent::Ready {
             model: s("model"),
@@ -1096,7 +1095,7 @@ impl App {
                 let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
                     continue;
                 };
-                let ts_ms = val.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+                let ts_ms = val.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let subject = val
                     .get("subject")
                     .and_then(|v| v.as_str())
@@ -3288,34 +3287,34 @@ fn dream_event_from_payload(ts_ms: i64, payload: &serde_json::Value) -> Option<D
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string(),
-        cycles: obj.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0),
+        cycles: obj.get("cycles").and_then(serde_json::Value::as_u64).unwrap_or(0),
         strengthened: obj
             .get("memories_strengthened")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         pruned: obj
             .get("memories_pruned")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         new_connections: obj
             .get("new_connections")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         hallucinations: obj
             .get("hallucinations_created")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         consciousness_before: obj
             .get("consciousness_before")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0) as f32,
         consciousness_after: obj
             .get("consciousness_after")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0) as f32,
         emerged: obj
             .get("emerged")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
     })
 }
@@ -3638,13 +3637,13 @@ fn summarize_payload(subject: &str, payload: &serde_json::Value) -> String {
         if let Some(agent) = obj.get("agent_id").and_then(|v| v.as_str()) {
             bits.push(format!("agent={agent}"));
         }
-        if let Some(theta) = obj.get("theta").and_then(|v| v.as_f64()) {
+        if let Some(theta) = obj.get("theta").and_then(serde_json::Value::as_f64) {
             bits.push(format!("θ={theta:.3}"));
         }
-        if let Some(phi) = obj.get("phi").and_then(|v| v.as_f64()) {
+        if let Some(phi) = obj.get("phi").and_then(serde_json::Value::as_f64) {
             bits.push(format!("Φ={phi:.3}"));
         }
-        if let Some(xi) = obj.get("xi").and_then(|v| v.as_f64()) {
+        if let Some(xi) = obj.get("xi").and_then(serde_json::Value::as_f64) {
             bits.push(format!("Ξ={xi:.3}"));
         }
         if let Some(level) = obj.get("consciousness_level").and_then(|v| v.as_str()) {
@@ -3712,13 +3711,13 @@ fn agent_snapshot_from_payload(
     let theta = obj
         .get("theta")
         .or_else(|| obj.get("phase"))
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0) as f32;
-    let phi = obj.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-    let coherence = obj.get("coherence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let phi = obj.get("phi").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
+    let coherence = obj.get("coherence").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
     let order_parameter = obj
         .get("order_parameter")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0) as f32;
     let handedness = obj
         .get("handedness")
@@ -3727,7 +3726,7 @@ fn agent_snapshot_from_payload(
         .to_string();
     let memory_count = obj
         .get("memory_count")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
 
     Some(AgentSnapshot {
