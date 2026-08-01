@@ -298,7 +298,11 @@ fn parse_agent_event(v: &serde_json::Value) -> Option<AgentEvent> {
     let kind = v.get("kind")?.as_str()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    let b = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let b = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     Some(match kind {
         "ready" => AgentEvent::Ready {
             model: s("model"),
@@ -1095,7 +1099,10 @@ impl App {
                 let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
                     continue;
                 };
-                let ts_ms = val.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let ts_ms = val
+                    .get("ts")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
                 let subject = val
                     .get("subject")
                     .and_then(|v| v.as_str())
@@ -3287,7 +3294,10 @@ fn dream_event_from_payload(ts_ms: i64, payload: &serde_json::Value) -> Option<D
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string(),
-        cycles: obj.get("cycles").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        cycles: obj
+            .get("cycles")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
         strengthened: obj
             .get("memories_strengthened")
             .and_then(serde_json::Value::as_u64)
@@ -3713,8 +3723,14 @@ fn agent_snapshot_from_payload(
         .or_else(|| obj.get("phase"))
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0) as f32;
-    let phi = obj.get("phi").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
-    let coherence = obj.get("coherence").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
+    let phi = obj
+        .get("phi")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let coherence = obj
+        .get("coherence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
     let order_parameter = obj
         .get("order_parameter")
         .and_then(serde_json::Value::as_f64)
