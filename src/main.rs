@@ -3192,7 +3192,7 @@ fn render_status_tab(f: &mut Frame, app: &App, area: Rect) {
                 .fg(phi_color(status.phi))
                 .bg(Color::Rgb(30, 30, 50)),
         )
-        .ratio(status.phi.clamp(0.0, 1.0) as f64);
+        .ratio(f64::from(status.phi.clamp(0.0, 1.0)));
     f.render_widget(phi_gauge, gauge_area[0]);
 
     // Xi gauge
@@ -3208,7 +3208,7 @@ fn render_status_tab(f: &mut Frame, app: &App, area: Rect) {
                 )),
         )
         .gauge_style(Style::default().fg(INFO).bg(Color::Rgb(30, 30, 50)))
-        .ratio(status.xi.clamp(0.0, 1.0) as f64);
+        .ratio(f64::from(status.xi.clamp(0.0, 1.0)));
     f.render_widget(xi_gauge, gauge_area[1]);
 
     // Order parameter gauge
@@ -3224,7 +3224,7 @@ fn render_status_tab(f: &mut Frame, app: &App, area: Rect) {
                 )),
         )
         .gauge_style(Style::default().fg(SUCCESS).bg(Color::Rgb(30, 30, 50)))
-        .ratio(status.order.clamp(0.0, 1.0) as f64);
+        .ratio(f64::from(status.order.clamp(0.0, 1.0)));
     f.render_widget(order_gauge, gauge_area[2]);
 
     // Right: text info
@@ -3813,10 +3813,10 @@ fn render_constellation_tab(f: &mut Frame, app: &App, area: Rect) {
     let plot_agents: Vec<(f64, f64, Color, bool, String)> = sorted_agents
         .iter()
         .map(|s| {
-            let theta = s.theta as f64;
+            let theta = f64::from(s.theta);
             // Radial distance: prefer coherence (always populated), fall back
             // to order_parameter for older payloads.
-            let r = (s.coherence.max(s.order_parameter).clamp(0.0, 1.0)) as f64;
+            let r = f64::from(s.coherence.max(s.order_parameter).clamp(0.0, 1.0));
             let r_eff = 0.15 + r * 0.85; // keep dots off the dead center
             let x = r_eff * theta.cos();
             let y = r_eff * theta.sin();
