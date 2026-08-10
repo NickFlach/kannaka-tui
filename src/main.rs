@@ -1864,12 +1864,9 @@ impl App {
         if let Some(rx) = &self.passthrough_pending {
             match rx.try_recv() {
                 Ok(res) => {
-                    let pop_running = self
-                        .messages
-                        .last()
-                        .is_some_and(|m| {
-                            matches!(m.role, Role::System) && m.content.starts_with("Running...")
-                        });
+                    let pop_running = self.messages.last().is_some_and(|m| {
+                        matches!(m.role, Role::System) && m.content.starts_with("Running...")
+                    });
                     if pop_running {
                         self.messages.pop();
                     }
@@ -3681,15 +3678,14 @@ fn format_bus_ts(ts_ms: i64) -> String {
         return "        ".to_string();
     }
     // Use chrono local time HH:MM:SS — matches what users see in `journalctl`.
-    chrono::DateTime::from_timestamp_millis(ts_ms)
-        .map_or_else(
-            || "        ".to_string(),
-            |dt| {
-                dt.with_timezone(&chrono::Local)
-                    .format("%H:%M:%S")
-                    .to_string()
-            },
-        )
+    chrono::DateTime::from_timestamp_millis(ts_ms).map_or_else(
+        || "        ".to_string(),
+        |dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        },
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
