@@ -753,9 +753,8 @@ impl App {
             return;
         }
         let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| ".".into());
-        self.harness_cwd = cwd.clone();
+            .map_or_else(|_| ".".into(), |p| p.to_string_lossy().into_owned());
+        self.harness_cwd.clone_from(&cwd);
         self.harness_status = HarnessStatus::Starting;
         let mode = self.harness_mode.clone();
         let model = self.harness_model.clone();
@@ -1032,7 +1031,7 @@ impl App {
                 self.push_harness(AgentLine::Notice(format!("[error: {t}]")));
             }
             AgentEvent::Mode(m) => {
-                self.harness_mode = m.clone();
+                self.harness_mode.clone_from(&m);
                 self.push_harness(AgentLine::Notice(format!("[mode → {m}]")));
             }
             AgentEvent::Closed(reason) => {
@@ -1809,7 +1808,7 @@ impl App {
         // `timeout_secs` — as long as 600s for `ask`. Now it is fully
         // async like every other op in this file.
         let bin = self.kannaka_bin.clone();
-        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
         let (tx, rx) = mpsc::channel::<CmdResult>();
         self.passthrough_pending = Some(rx);
         std::thread::spawn(move || {
@@ -1865,13 +1864,9 @@ impl App {
         if let Some(rx) = &self.passthrough_pending {
             match rx.try_recv() {
                 Ok(res) => {
-                    let pop_running = self
-                        .messages
-                        .last()
-                        .map(|m| {
-                            matches!(m.role, Role::System) && m.content.starts_with("Running...")
-                        })
-                        .unwrap_or(false);
+                    let pop_running = self.messages.last().is_some_and(|m| {
+                        matches!(m.role, Role::System) && m.content.starts_with("Running...")
+                    });
                     if pop_running {
                         self.messages.pop();
                     }
@@ -1994,7 +1989,7 @@ impl App {
                 }
                 Some(rest) if rest.starts_with("model ") => {
                     let m = rest["model ".len()..].trim().to_string();
-                    self.harness_model = m.clone();
+                    self.harness_model.clone_from(&m);
                     self.restart_harness();
                     self.push_harness(AgentLine::Notice(format!(
                         "[model set to {m} — type a task to start]"
@@ -2266,7 +2261,6 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<ChatChildEvent>();
         self.chat_child_rx = Some(rx);
         let bin = self.kannaka_bin.clone();
-        let tx_spawn = tx.clone();
         let proc_slot = std::sync::Arc::clone(&self.chat_child_proc);
         // Spawn-and-attach happens on a worker so the TUI doesn't block
         // for the ~15s HRM load. The worker:
@@ -2287,7 +2281,7 @@ impl App {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx_spawn.send(ChatChildEvent::Closed(format!("spawn failed: {e}")));
+                    let _ = tx.send(ChatChildEvent::Closed(format!("spawn failed: {e}")));
                     return;
                 }
             };
@@ -2295,14 +2289,14 @@ impl App {
             // turn-sender side can write to it. Stdout/stderr stay in
             // the worker.
             if let Some(stdin) = child.stdin.take() {
-                let _ = tx_spawn.send(ChatChildEvent::Stdin(stdin));
+                let _ = tx.send(ChatChildEvent::Stdin(stdin));
             } else {
-                let _ = tx_spawn.send(ChatChildEvent::Closed("no stdin pipe".into()));
+                let _ = tx.send(ChatChildEvent::Closed("no stdin pipe".into()));
                 return;
             }
             // Stderr reader thread — emits Ready on first ready event.
             if let Some(stderr) = child.stderr.take() {
-                let tx_err = tx_spawn.clone();
+                let tx_err = tx.clone();
                 std::thread::spawn(move || {
                     let reader = BufReader::new(stderr);
                     // map_while(Result::ok) instead of .flatten() —
@@ -2330,11 +2324,11 @@ impl App {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                         let kind = v["kind"].as_str().unwrap_or("chat").to_string();
                         let text = v["text"].as_str().unwrap_or("").to_string();
-                        let _ = tx_spawn.send(ChatChildEvent::Response { kind, text });
+                        let _ = tx.send(ChatChildEvent::Response { kind, text });
                     }
                 }
             }
-            let _ = tx_spawn.send(ChatChildEvent::Closed("child stdout EOF".into()));
+            let _ = tx.send(ChatChildEvent::Closed("child stdout EOF".into()));
         });
         self.chat_child = Some(ChatChildHandle {
             stdin: None,
@@ -3684,13 +3678,14 @@ fn format_bus_ts(ts_ms: i64) -> String {
         return "        ".to_string();
     }
     // Use chrono local time HH:MM:SS — matches what users see in `journalctl`.
-    chrono::DateTime::from_timestamp_millis(ts_ms)
-        .map(|dt| {
+    chrono::DateTime::from_timestamp_millis(ts_ms).map_or_else(
+        || "        ".to_string(),
+        |dt| {
             dt.with_timezone(&chrono::Local)
                 .format("%H:%M:%S")
                 .to_string()
-        })
-        .unwrap_or_else(|| "        ".to_string())
+        },
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
